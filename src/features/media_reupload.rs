@@ -105,7 +105,10 @@ impl<'a> MediaReupload<'a> {
         let own_jid = device_snapshot
             .pn
             .as_ref()
-            .ok_or(MediaReuploadError::NotLoggedIn)?;
+            .ok_or(MediaReuploadError::NotLoggedIn)?
+            .to_non_ad();
+        let chat_jid = req.chat_jid.to_non_ad();
+        let participant = req.participant.map(Jid::to_non_ad);
 
         // Register waiter BEFORE sending (to avoid race)
         let waiter = self.client.wait_for_node(
@@ -116,11 +119,11 @@ impl<'a> MediaReupload<'a> {
 
         // Build and send the receipt node
         let receipt_node = build_media_retry_receipt(
-            own_jid,
+            &own_jid,
             req.msg_id,
-            req.chat_jid,
+            &chat_jid,
             req.is_from_me,
-            req.participant,
+            participant.as_ref(),
             &ciphertext,
             &iv,
         );
