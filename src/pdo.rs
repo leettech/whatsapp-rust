@@ -22,6 +22,10 @@ use wacore::types::message::{ChatMessageId, EditAttribute, MessageCategory, Mess
 use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
+/// How many unrequested snapshot recoveries may hold a copy of their payload
+/// at once; why is on `Client::unrequested_snapshot_recovery_permits`.
+pub(crate) const UNREQUESTED_SNAPSHOT_RECOVERIES_QUEUED: usize = 2;
+
 #[derive(Clone, Debug)]
 pub(crate) struct PendingPdoRequest {
     pub(crate) message_info: Arc<MessageInfo>,
@@ -1125,10 +1129,25 @@ impl Client {
             );
             return;
         }
+        // Taken before the copy, never waited for. See the field for why.
+        let queued = match asked {
+            Some(_) => None,
+            None => {
+                let Some(permit) = self.unrequested_snapshot_recovery_permits.try_acquire_arc()
+                else {
+                    info!(
+                        "{UNREQUESTED_SNAPSHOT_RECOVERIES_QUEUED} unrequested snapshot recoveries are already queued; discarding {request_id}, the primary will answer the next ask"
+                    );
+                    return;
+                };
+                Some(permit)
+            }
+        };
         let payload = blob.to_vec();
         let request_id = request_id.to_string();
 
         self.runtime.spawn_detached(Box::pin(async move {
+            let _queued = queued;
             // Held across the decode and the apply, and taken by every reply,
             // matched or not. See the field for why.
             let _one_at_a_time = client.snapshot_recovery_lock.lock_arc().await;
@@ -3111,6 +3130,36 @@ mod tests {
                 None,
                 "the second, at the same version, was discarded as stale"
             );
+        }
+
+        #[tokio::test]
+        async fn an_unrequested_recovery_beyond_the_queue_is_discarded_before_it_is_copied() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let first = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            let second = regular_low_reply(8, "2@s.whatsapp.net", 0x6B);
+            let newer = regular_low_reply(9, "3@s.whatsapp.net", 0x7C);
+            deliver_together(
+                &client,
+                &[(&first, "first"), (&second, "second"), (&newer, "third")],
+                super::super::UNREQUESTED_SNAPSHOT_RECOVERIES_QUEUED,
+            )
+            .await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(
+                state.version, 8,
+                "the third was turned away before a task existed for it, newer or not"
+            );
+            assert_eq!(state.hash, [0x5A; 128]);
+
+            deliver_together(&client, &[(&newer, "fourth")], 1).await;
+            let state = regular_low_state(&client).await;
+            assert_eq!(
+                state.version, 9,
+                "once the queue drains, an unrequested reply is taken again"
+            );
+            assert_eq!(state.hash, [0x7C; 128]);
         }
 
         #[tokio::test]

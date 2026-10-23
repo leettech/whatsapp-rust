@@ -3818,8 +3818,9 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected -= size_of::<std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>>()
         - size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();
     // Snapshot recoveries from the primary are applied one at a time behind a
-    // shared lock; count its handle rather than raising the fixed base.
-    expected += size_of::<Arc<Mutex<()>>>();
+    // shared lock, and unrequested ones are admitted by a shared semaphore;
+    // count their handles rather than raising the fixed base.
+    expected += size_of::<Arc<Mutex<()>>>() + size_of::<Arc<async_lock::Semaphore>>();
     // The detached storage owner now also owns the reusable arena, replacing
     // its former inline async mutex. Account for the actual attachment rather
     // than raising the fixed Client base; retention includes test-only gates.
