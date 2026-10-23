@@ -40,8 +40,67 @@ const RECOVERABLE_COLLECTIONS: [wacore::appstate::patch_decode::WAPatchName; 4] 
     wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
 ];
 
+/// What a client keeps for snapshot recoveries from the primary, built on the
+/// first recovery reply.
+#[derive(Default)]
+pub(crate) struct SnapshotRecoveryState {
+    /// Serializes the decode and apply of snapshot recoveries.
+    ///
+    /// A reply is applied whether or not this process still remembers the ask
+    /// it answers, and the phone answers late and in bursts -- dozens of
+    /// whole-collection replies within seconds, to asks made over hours. One at
+    /// a time bounds that to one inflated collection in memory, and lets each
+    /// reply after the first find the collection already moved and be
+    /// discarded by the version check rather than racing it. Locked through
+    /// `lock_arc`, so the count of handles is the count of tasks holding or
+    /// waiting for it: one per matched reply, and one drainer for however many
+    /// unrequested replies are queued behind it.
+    pub(crate) lock: Arc<async_lock::Mutex<()>>,
+    /// Unrequested snapshot recoveries waiting, in arrival order, behind the
+    /// one task that applies them.
+    ///
+    /// The lock above bounds the decodes to one, not the copies: a reply's
+    /// payload is copied off the inbound lane before anything waits for the
+    /// lock, so a burst of unrequested replies would each hold a
+    /// collection-sized copy while it waited. A matched reply is bounded by its
+    /// claim -- one per ask -- but nothing bounds replies nobody asked for.
+    ///
+    /// No admitted reply is ever dropped or replaced before it is decoded:
+    /// which collection a reply is for is inside the payload, so any reply
+    /// discarded unread can be the only one for its collection. Every one is
+    /// applied in turn, and the older ones end as stale. What bounds the copies
+    /// is admission instead -- a count, and a byte budget of one reply of the
+    /// largest size the decode accepts, which one reply may always use. A
+    /// reply refused there is dropped before anything reads which collection
+    /// it was for, so a refusal marks the queue, and once it drains every
+    /// collection a recovery can be for is scheduled to sync again (see
+    /// `Client::converge_after_dropped_recovery`): one still stuck fails as
+    /// before and asks the primary again. An admitted reply that fails to
+    /// decode cannot be read either, but gets no such sync: the primary's
+    /// answer to the ask that sync would end in is likely the same unreadable
+    /// reply, so it would only loop. A sync mutex, held only to admit (and
+    /// copy) a reply or take one.
+    pub(crate) unrequested: std::sync::Mutex<UnrequestedRecoveryQueue>,
+}
+
+impl SnapshotRecoveryState {
+    /// How many unrequested replies are queued and the wire bytes they hold,
+    /// for the memory report.
+    pub(crate) fn queued_unrequested(&self) -> (usize, u64) {
+        let queue = self.unrequested.lock().unwrap_or_else(|p| p.into_inner());
+        (queue.queued.len(), queue.queued_bytes)
+    }
+}
+
+impl Client {
+    /// The snapshot recovery state, built on first use.
+    pub(crate) fn snapshot_recovery(&self) -> &SnapshotRecoveryState {
+        self.snapshot_recovery.get_or_init(Box::default)
+    }
+}
+
 /// The unrequested snapshot recoveries waiting behind the one being applied;
-/// why is on `Client::unrequested_snapshot_recoveries`.
+/// why is on `SnapshotRecoveryState::unrequested`.
 #[derive(Default)]
 pub(crate) struct UnrequestedRecoveryQueue {
     /// Whether a drainer task is applying replies.
@@ -1202,7 +1261,8 @@ impl Client {
         let wire = blob.len() as u64;
         let refused = {
             let mut queue = self
-                .unrequested_snapshot_recoveries
+                .snapshot_recovery()
+                .unrequested
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let reply = || QueuedRecoveryReply {
@@ -1261,7 +1321,8 @@ impl Client {
             client.recover_from_reply(None, next).await;
             let taken = {
                 let mut queue = client
-                    .unrequested_snapshot_recoveries
+                    .snapshot_recovery()
+                    .unrequested
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 match queue.queued.pop_front() {
@@ -1294,7 +1355,8 @@ impl Client {
     pub(crate) fn abandon_unrequested_recoveries(self: &Arc<Self>) {
         let dropped = {
             let mut queue = self
-                .unrequested_snapshot_recoveries
+                .snapshot_recovery()
+                .unrequested
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             queue.running = false;
@@ -1325,7 +1387,7 @@ impl Client {
         } = reply;
         // Held across the decode and the apply, and taken by every reply,
         // matched or not. See the field for why.
-        let _one_at_a_time = self.snapshot_recovery_lock.lock_arc().await;
+        let _one_at_a_time = self.snapshot_recovery().lock.lock_arc().await;
 
         // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
         // pins its instantiation: off the runtime's async workers either way.
@@ -3174,7 +3236,7 @@ mod tests {
         /// The request ids of the unrequested replies queued behind the drainer,
         /// and the wire bytes they hold.
         fn queued_unrequested_recoveries(client: &Arc<Client>) -> (Vec<String>, u64) {
-            let queue = client.unrequested_snapshot_recoveries.lock().unwrap();
+            let queue = client.snapshot_recovery().unrequested.lock().unwrap();
             (
                 queue
                     .queued
@@ -3202,9 +3264,10 @@ mod tests {
         /// unrequested drainer has finished.
         async fn wait_for_recoveries(client: &Arc<Client>) {
             crate::test_utils::poll_until("every recovery reply to finish", || {
-                Arc::strong_count(&client.snapshot_recovery_lock) == 1
+                Arc::strong_count(&client.snapshot_recovery().lock) == 1
                     && !client
-                        .unrequested_snapshot_recoveries
+                        .snapshot_recovery()
+                        .unrequested
                         .lock()
                         .unwrap()
                         .running
@@ -3226,10 +3289,10 @@ mod tests {
             tasks: usize,
             queued: &[&str],
         ) {
-            let held = client.snapshot_recovery_lock.lock().await;
+            let held = client.snapshot_recovery().lock.lock().await;
             hand_over(client, replies).await;
             assert_eq!(
-                Arc::strong_count(&client.snapshot_recovery_lock),
+                Arc::strong_count(&client.snapshot_recovery().lock),
                 1 + tasks,
                 "tasks queued on the recovery lock"
             );
@@ -3500,7 +3563,7 @@ mod tests {
                 Some(vec![0; wacore::history_sync::MAX_DECOMPRESSED as usize]);
             oversized.is_compressed = Some(false);
 
-            let held = client.snapshot_recovery_lock.lock().await;
+            let held = client.snapshot_recovery().lock.lock().await;
             hand_over(
                 &client,
                 &[
@@ -3519,7 +3582,8 @@ mod tests {
             );
             assert!(
                 client
-                    .unrequested_snapshot_recoveries
+                    .snapshot_recovery()
+                    .unrequested
                     .lock()
                     .unwrap()
                     .overflowed
@@ -3534,7 +3598,8 @@ mod tests {
             assert_eq!(regular_low_state(&client).await.version, 9);
             assert!(
                 !client
-                    .unrequested_snapshot_recoveries
+                    .snapshot_recovery()
+                    .unrequested
                     .lock()
                     .unwrap()
                     .overflowed
@@ -3551,7 +3616,7 @@ mod tests {
                 request_id: request_id.into(),
             };
             {
-                let mut queue = client.unrequested_snapshot_recoveries.lock().unwrap();
+                let mut queue = client.snapshot_recovery().unrequested.lock().unwrap();
                 queue.running = true;
                 queue.queued.push_back(reply("stranded"));
                 queue.queued_bytes = 16;
@@ -3564,7 +3629,7 @@ mod tests {
                 reply("in-flight"),
             ));
             {
-                let queue = client.unrequested_snapshot_recoveries.lock().unwrap();
+                let queue = client.snapshot_recovery().unrequested.lock().unwrap();
                 assert!(!queue.running, "a later reply starts a drainer of its own");
                 assert!(queue.queued.is_empty());
                 assert_eq!(queue.queued_bytes, 0);

@@ -445,6 +445,15 @@ impl Client {
                 ),
                 None => (0, 0),
             };
+        // `get()` for the same reason: a client that never received a
+        // recovery reply has nothing queued and builds nothing here.
+        let (
+            app_state_unrequested_recoveries_queued,
+            app_state_unrequested_recoveries_queued_bytes,
+        ) = self
+            .snapshot_recovery
+            .get()
+            .map_or((0, 0), |state| state.queued_unrequested());
         let offline_receipt_buffer = {
             let buffer = self
                 .offline_receipt_buffer
@@ -610,6 +619,8 @@ impl Client {
             app_state_key_requests,
             app_state_key_cache,
             app_state_recovery_requests,
+            app_state_unrequested_recoveries_queued,
+            app_state_unrequested_recoveries_queued_bytes,
             app_state_syncing,
             status_privacy,
             signal_sessions,

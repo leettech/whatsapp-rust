@@ -755,6 +755,19 @@ pub struct MemoryReport {
     /// Bounded by the number of collections in practice, but retained until a
     /// reply consumes the entry, so it is reported rather than assumed small.
     pub app_state_recovery_requests: usize,
+    /// Snapshot recoveries the primary sent unasked, queued behind the one
+    /// being applied.
+    ///
+    /// Bounded at 64 replies, plus the one in flight. Reads 0 until the first
+    /// recovery reply builds the state that holds them.
+    pub app_state_unrequested_recoveries_queued: usize,
+    /// Wire bytes the queued unrequested recoveries hold.
+    ///
+    /// Bounded by `wacore::history_sync::MAX_DECOMPRESSED`, except that one
+    /// reply of up to the slightly larger compressed wire ceiling may always
+    /// wait alone; the reply in flight is not counted. Reads 0 until the first
+    /// recovery reply builds the state that holds them.
+    pub app_state_unrequested_recoveries_queued_bytes: u64,
     pub app_state_syncing: usize,
     /// Synced audience retention. `entries` counts top-level JIDs, custom-list
     /// records, and JIDs inside those lists. `bytes` attributes the shared
@@ -881,7 +894,8 @@ impl MemoryReport {
         let total: u64 = self.collections().iter().map(|(_, c)| c.bytes).sum();
         let total = total
             .saturating_add(self.inbound_chat_charged_bytes)
-            .saturating_add(self.inbound_ack_charged_bytes);
+            .saturating_add(self.inbound_ack_charged_bytes)
+            .saturating_add(self.app_state_unrequested_recoveries_queued_bytes);
         let total = self.subsystems.iter().fold(total, |sum, retained| {
             sum.saturating_add(retained.stats.bytes)
         });
@@ -938,6 +952,10 @@ impl MemoryReport {
             (
                 "app_state_recovery_requests",
                 n(self.app_state_recovery_requests),
+            ),
+            (
+                "app_state_unrequested_recoveries_queued",
+                n(self.app_state_unrequested_recoveries_queued),
             ),
             ("app_state_syncing", n(self.app_state_syncing)),
             ("status_privacy", self.status_privacy.entries),
@@ -1069,6 +1087,12 @@ impl std::fmt::Display for MemoryReport {
             f,
             "  app_state_recovery:     {}",
             self.app_state_recovery_requests
+        )?;
+        writeln!(
+            f,
+            "  app_state_unrequested_recoveries: {} ({} B)",
+            self.app_state_unrequested_recoveries_queued,
+            self.app_state_unrequested_recoveries_queued_bytes
         )?;
         writeln!(f, "  app_state_syncing:      {}", self.app_state_syncing)?;
         line(f, "status_privacy:", &self.status_privacy)?;
@@ -2070,44 +2094,11 @@ pub struct Client {
     /// are user-paced, so there is nothing to gain from finer granularity.
     /// Inline: only ever locked via `&self` on the `Arc`-held `Client`.
     pub(crate) app_state_send_lock: Mutex<()>,
-    /// Serializes the decode and apply of snapshot recoveries from the primary.
-    ///
-    /// A reply is applied whether or not this process still remembers the ask
-    /// it answers, and the phone answers late and in bursts -- dozens of
-    /// whole-collection replies within seconds, to asks made over hours. One at
-    /// a time bounds that to one inflated collection in memory, and lets each
-    /// reply after the first find the collection already moved and be
-    /// discarded by the version check rather than racing it. Locked through
-    /// `lock_arc`, so the count of handles is the count of tasks holding or
-    /// waiting for it: one per matched reply, and one drainer for however many
-    /// unrequested replies are queued behind it.
-    pub(crate) snapshot_recovery_lock: Arc<Mutex<()>>,
-    /// Unrequested snapshot recoveries waiting, in arrival order, behind the
-    /// one task that applies them.
-    ///
-    /// The lock above bounds the decodes to one, not the copies: a reply's
-    /// payload is copied off the inbound lane before anything waits for the
-    /// lock, so a burst of unrequested replies would each hold a
-    /// collection-sized copy while it waited. A matched reply is bounded by its
-    /// claim -- one per ask -- but nothing bounds replies nobody asked for.
-    ///
-    /// No admitted reply is ever dropped or replaced before it is decoded:
-    /// which collection a reply is for is inside the payload, so any reply
-    /// discarded unread can be the only one for its collection. Every one is
-    /// applied in turn, and the older ones end as stale. What bounds the copies
-    /// is admission instead -- a count, and a byte budget of one reply of the
-    /// largest size the decode accepts, which one reply may always use. A
-    /// reply refused there is dropped before anything reads which collection
-    /// it was for, so a refusal marks the queue, and once it drains every
-    /// collection a recovery can be for is scheduled to sync again (see
-    /// `Client::converge_after_dropped_recovery`): one still stuck fails as
-    /// before and asks the primary again. An admitted reply that fails to
-    /// decode cannot be read either, but gets no such sync: the primary's
-    /// answer to the ask that sync would end in is likely the same unreadable
-    /// reply, so it would only loop. A sync mutex, held only to admit (and
-    /// copy) a reply or take one.
-    pub(crate) unrequested_snapshot_recoveries:
-        std::sync::Mutex<crate::pdo::UnrequestedRecoveryQueue>,
+    /// The state behind snapshot recoveries from the primary, built when the
+    /// first recovery reply arrives. Most clients never receive one, so they
+    /// pay for this cell and nothing else; what it holds, and why, is on
+    /// `crate::pdo::SnapshotRecoveryState`.
+    pub(crate) snapshot_recovery: std::sync::OnceLock<Box<crate::pdo::SnapshotRecoveryState>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 

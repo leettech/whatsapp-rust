@@ -613,7 +613,7 @@ impl AppStateProcessor {
     /// Claims a reply together with its request generation, before decoding.
     ///
     /// The reply path no longer compares the generation (see
-    /// [`RecoveryRequest`]) and claims through [`Self::claim_recovery_reply`];
+    /// `RecoveryRequest`) and claims through [`Self::claim_recovery_reply`];
     /// this stays for callers outside this crate.
     pub async fn claim_recovery_request_with_generation_by_id(
         &self,
