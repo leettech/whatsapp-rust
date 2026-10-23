@@ -2080,18 +2080,22 @@ pub struct Client {
     /// discarded by the version check rather than racing it. Locked through
     /// `lock_arc`, so the count of handles is the count of replies in flight.
     pub(crate) snapshot_recovery_lock: Arc<Mutex<()>>,
-    /// Admits unrequested snapshot recoveries into the queue on the lock above.
+    /// Unrequested snapshot recoveries: the one being applied, and at most one
+    /// waiting behind it, which the newest arrival replaces.
     ///
-    /// The lock bounds the decodes to one, not the copies: a reply's payload
-    /// is copied off the inbound lane before its task waits for the lock, so a
-    /// burst of unrequested replies would hold a collection-sized copy each
-    /// while it waited. A matched reply is bounded by its claim -- one per
-    /// ask -- but nothing bounds replies nobody asked for, so they take a
-    /// permit before the copy and give it back when their task ends, and one
-    /// that finds none is discarded at once rather than awaited. Two is one
-    /// being applied and one waiting: whatever the first applies leaves every
-    /// later reply of the burst behind it, to be discarded as stale anyway.
-    pub(crate) unrequested_snapshot_recovery_permits: Arc<async_lock::Semaphore>,
+    /// The lock above bounds the decodes to one, not the copies: a reply's
+    /// payload is copied off the inbound lane before anything waits for the
+    /// lock, so a burst of unrequested replies would each hold a
+    /// collection-sized copy while it waited. A matched reply is bounded by its
+    /// claim -- one per ask -- but nothing bounds replies nobody asked for.
+    /// Turning the extra ones away would bound them too, but it would drop the
+    /// wrong ones: a burst answers asks made at different times, so the last to
+    /// arrive carries the primary's newest state, and every reply before it is
+    /// at best the same collection at an older version. One waiting slot that
+    /// the newest arrival overwrites keeps two copies in memory and never drops
+    /// the newest reply. A sync mutex, held only for a swap.
+    pub(crate) unrequested_snapshot_recoveries:
+        std::sync::Mutex<crate::pdo::UnrequestedRecoveryQueue>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 
