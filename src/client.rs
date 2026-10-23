@@ -2070,6 +2070,16 @@ pub struct Client {
     /// are user-paced, so there is nothing to gain from finer granularity.
     /// Inline: only ever locked via `&self` on the `Arc`-held `Client`.
     pub(crate) app_state_send_lock: Mutex<()>,
+    /// Serializes the decode and apply of snapshot recoveries from the primary.
+    ///
+    /// A reply is applied whether or not this process still remembers the ask
+    /// it answers, and the phone answers late and in bursts -- dozens of
+    /// whole-collection replies within seconds, to asks made over hours. One at
+    /// a time bounds that to one inflated collection in memory, and lets each
+    /// reply after the first find the collection already moved and be
+    /// discarded by the version check rather than racing it. Locked through
+    /// `lock_arc`, so the count of handles is the count of replies in flight.
+    pub(crate) snapshot_recovery_lock: Arc<Mutex<()>>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,
     pub(crate) initial_app_state_keys_received: AtomicBool,
 

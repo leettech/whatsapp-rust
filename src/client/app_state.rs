@@ -3434,19 +3434,32 @@ impl Client {
     ///
     /// The caller is already detached from the inbound path, so this waits for
     /// the reservation on its own time.
+    ///
+    /// `request_id` is the ask the reply was matched to, or `None` for a reply
+    /// nothing here is waiting for any more, which is applied all the same when
+    /// it moves the collection forward.
     pub(crate) async fn apply_recovered_collection(
         &self,
         name: &str,
-        request_id: &str,
-        generation: u64,
+        request_id: Option<&str>,
         recovery: waproto::whatsapp::SyncdSnapshotRecovery,
     ) {
-        if self.connection_generation.load(Ordering::Acquire) != generation {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
-            return;
-        }
+        self.write_recovered_collection(name, recovery).await;
+        // Released at every ending, applied or not, and whichever id the ask
+        // was made under. The question it raised has been answered -- with this
+        // collection, or with one this side refused or already holds past --
+        // and a marker left standing would suppress the next escalation for the
+        // rest of the window over a collection no less stuck than before.
+        self.get_app_state_processor()
+            .end_recovery_answer(name, request_id)
+            .await;
+    }
+
+    async fn write_recovered_collection(
+        &self,
+        name: &str,
+        recovery: waproto::whatsapp::SyncdSnapshotRecovery,
+    ) {
         // `WAPatchName::from_str` is infallible: every unrecognised name maps to
         // `Unknown`, which is one shared reservation slot and one collection
         // this side has no rules for. Rejecting it explicitly is the difference
@@ -3454,15 +3467,20 @@ impl Client {
         // reservation that means nothing.
         let patch_name = name.parse::<WAPatchName>().unwrap_or(WAPatchName::Unknown);
         if patch_name == WAPatchName::Unknown {
-            // Released for the same reason as every other ending that is not an
-            // apply: the ask has been answered, badly, and keeping it would
-            // refuse the next one for nothing.
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery names an unknown collection {name}; ignoring"
+            );
+            return;
+        }
+        // Never asked for, so never applied either. Refusing it at the ask used
+        // to be enough, because a reply had to match an ask; now that one need
+        // not, the block list needs its own refusal here, for the reason the
+        // ask gives.
+        if patch_name == WAPatchName::CriticalBlock {
+            warn!(
+                target: "Client/AppState",
+                "Discarding a snapshot recovery for {name}: the block list is not recovered from the primary"
             );
             return;
         }
@@ -3478,9 +3496,6 @@ impl Client {
             .get_int(wacore::iq::abprops::web::SNAPSHOT_RECOVERY_MAX_MUTATIONS_COUNT_ALLOWED)
             .await;
         if allowed > 0 && recovery.mutation_records.len() as i64 > allowed {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
             warn!(
                 target: "Client/AppState",
                 "Snapshot recovery for {name} carries {} records, over the {allowed} allowed; refusing it",
@@ -3489,18 +3504,7 @@ impl Client {
             return;
         }
 
-        // Refused before anything is reserved on its behalf: an unsolicited
-        // reply should cost a map lookup, not a wait. The marker is only *taken*
-        // once the reservation is held, so a wait that times out does not
-        // consume a request that was really made.
         let proc = self.get_app_state_processor();
-        if !proc.has_recovery_request(name).await {
-            warn!(
-                target: "Client/AppState",
-                "Ignoring an unsolicited snapshot recovery for {name}: nothing here asked for one"
-            );
-            return;
-        }
 
         // The keys the primary signed these records with, asked for before the
         // reservation rather than during it. A recovery is reached because the
@@ -3544,54 +3548,35 @@ impl Client {
             }
         }
 
-        let Ok(_reservation) = rt_timeout(
-            &*self.runtime,
-            APP_STATE_RESERVATION_WAIT,
-            self.app_state_syncing.begin(patch_name, SyncHolder::Sync),
-        )
-        .await
-        else {
-            // Released, not left claimed. The reply is being dropped, and one
-            // ask has one reply -- so holding the request would refuse a repeat
-            // of this one and suppress the next escalation for the rest of the
-            // window, over a collection still exactly as stuck as it was.
-            proc.take_recovery_request_by_id(request_id).await;
-            warn!(
-                target: "Client/AppState",
-                "Gave up waiting to reserve {name} for a snapshot recovery"
-            );
-            return;
-        };
-
-        // Taken by the id, never by the name. The reservation above may wait
-        // longer than a request lives -- 450 seconds against a 300-second TTL --
-        // so by the time this runs the ask that produced this reply can have
-        // expired and been replaced. Taking by name would consume the
-        // replacement's marker, apply the older reply, and have the newer one
-        // refused as unsolicited.
-        let Some((_, asked_on)) = proc
-            .take_recovery_request_with_generation_by_id(request_id)
+        // The reservation is a connection's, and a disconnect clears the
+        // registry wholesale, so a guard taken before one stops excluding the
+        // new connection's own sync from the rows about to be written. What
+        // this write stands behind is therefore the generation current while
+        // the reservation is held -- read before the wait and confirmed after
+        // it, and reserved again under the new one if a reconnect landed in
+        // between -- not the one the ask was made on: the reply is the
+        // account's, and the connection that asked for it may be long gone.
+        let Ok((_reservation, generation)) =
+            rt_timeout(&*self.runtime, APP_STATE_RESERVATION_WAIT, async {
+                loop {
+                    let generation = self.connection_generation.load(Ordering::Acquire);
+                    let reservation = self
+                        .app_state_syncing
+                        .begin(patch_name, SyncHolder::Sync)
+                        .await;
+                    if self.connection_generation.load(Ordering::Acquire) == generation {
+                        return (reservation, generation);
+                    }
+                }
+            })
             .await
         else {
-            debug!(target: "Client/AppState", "The recovery request for {name} is no longer outstanding; dropping this reply");
-            return;
-        };
-        if asked_on != generation {
-            debug!(target: "Client/AppState", "Dropping the {name} recovery from a retired request generation");
-            return;
-        }
-
-        // Rechecked after the waits above, not only before them. A disconnect
-        // during the key share or the reservation clears the registry, so the
-        // guard this holds would no longer exclude the new connection's own
-        // sync from the rows about to be written.
-        if self.connection_generation.load(Ordering::Acquire) != generation {
-            debug!(
+            warn!(
                 target: "Client/AppState",
-                "Dropping the {name} recovery: the connection it belongs to went while it waited"
+                "Gave up waiting to reserve {name} for a snapshot recovery; discarding it"
             );
             return;
-        }
+        };
 
         // The generation check above is true only until the next await. Beneath
         // this call are a store lookup per key, a whole collection's worth of
@@ -3604,7 +3589,7 @@ impl Client {
         // held across the awaits inside the apply, and `Client` carries trait
         // objects that are neither on wasm.
         let live = Arc::clone(&self.connection_generation);
-        let still_current = move || live.load(Ordering::Acquire) == asked_on;
+        let still_current = move || live.load(Ordering::Acquire) == generation;
         // The recovery's own version, read before `apply_snapshot_recovery`
         // moves `recovery`: it is the post-apply cursor for the semantic
         // context below. `apply_snapshot_recovery` refuses a version-less
@@ -3650,9 +3635,9 @@ impl Client {
                 }
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Retired) => {
-                debug!(
+                info!(
                     target: "Client/AppState",
-                    "Dropping the {name} recovery: the connection it belongs to went before it was written"
+                    "Discarding the primary's {name} at v{recovery_version}: the connection went while it was being prepared"
                 );
             }
             Ok(wacore::appstate_sync::RecoveryOutcome::Stale { held, offered }) => {
@@ -3662,8 +3647,8 @@ impl Client {
                 );
             }
             Err(e) => {
-                // The marker stays taken. One request was answered, and this was
-                // the answer -- no second reply is coming, so putting it back
+                // The ask is released all the same, by the caller. One request
+                // was answered and this was the answer, so keeping its marker
                 // would only suppress the next ask for the rest of the window
                 // while the collection stayed stuck.
                 //
@@ -4847,9 +4832,23 @@ mod tests {
         );
     }
 
+    fn empty_recovery(collection: &str, version: u64) -> wa::SyncdSnapshotRecovery {
+        let mut recovery = wa::SyncdSnapshotRecovery::default();
+        recovery.collection_name = Some(collection.to_string());
+        let mut synced = wa::SyncdVersion::default();
+        synced.version = Some(version);
+        recovery.version = buffa::MessageField::some(synced);
+        recovery.collection_lthash = Some(vec![0x5A; 128]);
+        recovery
+    }
+
+    /// The phone answers whenever it answers, and the connection that asked
+    /// is often gone by then: the answer is the account's, so it is applied
+    /// under whatever connection is current, and the ask it settled is spent.
     #[tokio::test]
-    async fn recovery_from_retired_request_generation_does_not_advance_state() {
-        let client = crate::test_utils::create_test_client_with_name("retired-recovery").await;
+    async fn recovery_from_an_older_request_generation_is_applied_under_the_current_one() {
+        let client =
+            crate::test_utils::create_test_client_with_name("older-generation-recovery").await;
         client
             .persistence_manager
             .backend()
@@ -4874,31 +4873,51 @@ mod tests {
         client
             .connection_generation
             .store(generation + 1, Ordering::Release);
-        let mut recovery = wa::SyncdSnapshotRecovery::default();
-        recovery.collection_name = Some("regular_low".to_string());
-        let mut version = wa::SyncdVersion::default();
-        version.version = Some(8);
-        recovery.version = buffa::MessageField::some(version);
-        recovery.collection_lthash = Some(vec![0; 128]);
-        client
-            .apply_recovered_collection("regular_low", "old-request", generation + 1, recovery)
-            .await;
-        assert_eq!(
-            client
-                .persistence_manager
-                .backend()
-                .get_version("regular_low")
+        assert!(
+            proc.claim_recovery_request_by_id("old-request")
                 .await
-                .unwrap()
-                .unwrap()
-                .version,
-            7
+                .is_some()
         );
+        client
+            .apply_recovered_collection(
+                "regular_low",
+                Some("old-request"),
+                empty_recovery("regular_low", 8),
+            )
+            .await;
+        let stored = client
+            .persistence_manager
+            .backend()
+            .get_version("regular_low")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.version, 8);
+        assert_eq!(stored.hash, [0x5A; 128]);
         assert!(!proc.has_recovery_request("regular_low").await);
         assert!(
             proc.mark_recovery_requested_on_generation("regular_low", generation + 1)
                 .await,
-            "retired answer does not suppress retries"
+            "an applied answer does not suppress the next ask"
+        );
+    }
+
+    /// The block list is never asked for, and a reply no longer has to match
+    /// an ask to be applied, so the apply refuses it on its own.
+    #[tokio::test]
+    async fn a_recovery_of_the_block_list_is_never_applied() {
+        let client = crate::test_utils::create_test_client_with_name("block-list-recovery").await;
+        client
+            .apply_recovered_collection("critical_block", None, empty_recovery("critical_block", 8))
+            .await;
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_version("critical_block")
+                .await
+                .unwrap()
+                .is_none_or(|state| state.version == 0)
         );
     }
 

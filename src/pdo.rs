@@ -716,10 +716,10 @@ impl Client {
         // is public and takes a name.
         //
         // A name this client has no rules for is refused outright: the reply
-        // side rejects `Unknown` *before* spending the marker, and an
-        // outstanding request only ever expires when the same name is asked for
-        // again -- so one typo would sit in the map for the life of the process,
-        // having been sent to the phone for nothing.
+        // side refuses `Unknown` whatever the phone sends back, so the ask
+        // would have the primary serialize a whole collection for nothing, and
+        // an unanswered marker for it would sit in the map until the same name
+        // was asked for again.
         let patch_name = collection
             .parse::<wacore::appstate::patch_decode::WAPatchName>()
             .unwrap_or(wacore::appstate::patch_decode::WAPatchName::Unknown);
@@ -728,11 +728,11 @@ impl Client {
                 "{collection} is not an app-state collection this client knows"
             ));
         }
-        // And the block list is refused because a caller asking for it would
-        // otherwise mark it pending and send, and the reply passes the
-        // known-collection check and applies. Rebuilding a block list from a
-        // device that may itself be behind is the one collection where being
-        // wrong means talking to somebody who was blocked.
+        // And the block list is refused, here and again where a reply is
+        // applied, since a reply no longer has to match an ask to be applied.
+        // Rebuilding a block list from a device that may itself be behind is
+        // the one collection where being wrong means talking to somebody who
+        // was blocked.
         if patch_name == wacore::appstate::patch_decode::WAPatchName::CriticalBlock {
             return Err(anyhow::anyhow!(
                 "the block list is not recovered from the primary"
@@ -1028,54 +1028,60 @@ impl Client {
             // one's decoder is still working against -- and that task, finding
             // no marker at the end, would drop a usable recovery.
             let proc = self.get_app_state_processor();
-            let Some(name) = proc.claim_recovery_request_by_id(request_id).await else {
-                warn!(
-                    "Ignoring a snapshot recovery with no collection: nothing here is waiting on that ask"
-                );
-                return;
-            };
-            proc.take_recovery_request_by_id(request_id).await;
-            warn!(
-                "Snapshot recovery response for {name} carries no collection; it may be asked for again"
-            );
+            match proc.claim_recovery_reply(request_id).await {
+                wacore::appstate_sync::RecoveryClaim::Claimed(name) => {
+                    proc.take_recovery_request_by_id(request_id).await;
+                    warn!(
+                        "Snapshot recovery response for {name} carries no collection; it may be asked for again"
+                    );
+                }
+                wacore::appstate_sync::RecoveryClaim::AlreadyAnswering(_) => {}
+                wacore::appstate_sync::RecoveryClaim::Unrequested => info!(
+                    "Discarding a snapshot recovery response that carries no collection and answers no ask outstanding here"
+                ),
+            }
             return;
         };
 
-        // Which collection this id was asked about -- claimed, before a byte is
-        // cloned or inflated.
+        // Which collection this id was asked about, if any -- claimed, before a
+        // byte is cloned or inflated.
         //
-        // Correlating here rather than after the decode is the difference
-        // between a map read and up to 64 MiB of inflate plus a record graph
-        // built for a reply that was never eligible to apply. Claiming rather
-        // than reading is what makes one ask cost one decode: a response that
-        // repeats the result, or a second copy arriving before the first is
-        // consumed, would otherwise each spawn a collection-sized job against
-        // the same request.
+        // Claiming rather than reading is what makes one ask cost one decode: a
+        // response that repeats the result, or a second copy arriving before the
+        // first is consumed, would otherwise each spawn a collection-sized job
+        // against the same request.
         //
         // The payload names a collection too, but that is the reply's claim
         // about itself -- and with two recoveries outstanding, a reply carrying
         // A's id and B's name would select B's marker and be checked against its
-        // own name, which always agrees. So the ask decides.
-        let Some((asked, generation)) = self
-            .get_app_state_processor()
-            .claim_recovery_request_with_generation_by_id(request_id)
-            .await
-        else {
-            warn!("Ignoring a snapshot recovery nothing here asked for");
-            return;
+        // own name, which always agrees. So where there is an ask, it decides.
+        //
+        // Where there is none, the reply is still decoded and applied. The
+        // phone answers late and in bursts, to asks made minutes or hours
+        // earlier -- on connections or in processes that are gone, or since
+        // replaced by a newer ask -- and refusing everything this process cannot
+        // match threw away nearly every answer a stuck collection ever got.
+        // What keeps a late answer from rolling a collection back is the
+        // version check at apply, not the bookkeeping here; the decode it costs
+        // is accepted because only the primary reaches this path, and the lock
+        // below makes a burst cost one decode at a time.
+        let proc = self.get_app_state_processor();
+        let asked = match proc.claim_recovery_reply(request_id).await {
+            wacore::appstate_sync::RecoveryClaim::Claimed(name) => Some(name),
+            wacore::appstate_sync::RecoveryClaim::AlreadyAnswering(name) => {
+                info!(
+                    "Ignoring a repeat of the {name} snapshot recovery answering {request_id}: a copy of it is already being handled"
+                );
+                return;
+            }
+            wacore::appstate_sync::RecoveryClaim::Unrequested => {
+                info!(
+                    "Snapshot recovery {request_id} answers no ask outstanding here; applying it as a late or unsolicited recovery from the primary"
+                );
+                None
+            }
         };
-
-        if self
-            .connection_generation
-            .load(std::sync::atomic::Ordering::Acquire)
-            != generation
-        {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
-            debug!("Dropping retired recovery for {asked} before decoding");
-            return;
-        }
+        let about = asked.as_deref().unwrap_or("an unrequested collection");
 
         // The whole continuation is detached, not just the CPU inside it.
         // `receive.rs` awaits this handler inline and inbound processing is
@@ -1110,11 +1116,11 @@ impl Client {
             wacore::history_sync::MAX_DECOMPRESSED
         };
         if blob.len() as u64 > max_wire {
-            self.get_app_state_processor()
-                .take_recovery_request_by_id(request_id)
-                .await;
+            if asked.is_some() {
+                proc.take_recovery_request_by_id(request_id).await;
+            }
             warn!(
-                "Snapshot recovery for {asked} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
+                "Snapshot recovery for {about} is {} bytes on the wire, over the {max_wire} this path allows; refusing it",
                 blob.len()
             );
             return;
@@ -1123,6 +1129,10 @@ impl Client {
         let request_id = request_id.to_string();
 
         self.runtime.spawn_detached(Box::pin(async move {
+            // Held across the decode and the apply, and taken by every reply,
+            // matched or not. See the field for why.
+            let _one_at_a_time = client.snapshot_recovery_lock.lock_arc().await;
+
             // Up to 64 MiB of inflate plus a decode wide enough that `waproto`
             // pins its instantiation: off the runtime's async workers either
             // way.
@@ -1131,6 +1141,7 @@ impl Client {
             })
             .await;
 
+            let proc = client.get_app_state_processor();
             let recovery = match decoded {
                 Ok(recovery) => recovery,
                 Err(e) => {
@@ -1139,22 +1150,23 @@ impl Client {
                     // answer carried is the only way to say which ask this was
                     // -- and leaving the marker would suppress every retry for
                     // the rest of the window over a question already answered.
-                    let proc = client.get_app_state_processor();
-                    match proc.take_recovery_request_by_id(&request_id).await {
-                        Some(name) => warn!(
-                            "Snapshot recovery response for {name} {e}; the collection may be asked for again"
-                        ),
-                        None => warn!("Snapshot recovery response {e}"),
+                    match &asked {
+                        Some(name) => {
+                            proc.take_recovery_request_by_id(&request_id).await;
+                            warn!(
+                                "Snapshot recovery response for {name} {e}; the collection may be asked for again"
+                            );
+                        }
+                        None => warn!("Discarding an unrequested snapshot recovery response: {e}"),
                     }
                     return;
                 }
             };
 
-            let proc = client.get_app_state_processor();
-
-            match recovery.collection_name.as_deref() {
-                Some(named) if named == asked => {}
-                other => {
+            let matched = asked.is_some();
+            let name = match (asked, recovery.collection_name.as_deref()) {
+                (Some(asked), Some(named)) if named == asked => asked,
+                (Some(asked), other) => {
                     proc.take_recovery_request_by_id(&request_id).await;
                     warn!(
                         "Snapshot recovery answering the ask for {asked} names {}; refusing it",
@@ -1162,25 +1174,19 @@ impl Client {
                     );
                     return;
                 }
-            }
-
-            // The reservation is a connection's, and a disconnect clears the
-            // registry wholesale -- so a task that started before one and
-            // applied after it would write beside the new connection's own sync
-            // and dispatch events for a session that has since been replaced.
-            if client.connection_generation.load(std::sync::atomic::Ordering::Acquire) != generation
-            {
-                // Spent, like every other ending that is not an apply. The ask
-                // was answered; dropping the answer because the connection went
-                // is this side's decision, and leaving the marker would have the
-                // next connection unable to ask again until the window ran out.
-                proc.take_recovery_request_by_id(&request_id).await;
-                debug!("Dropping the {asked} recovery: the connection it belongs to is gone");
-                return;
-            }
+                (None, Some(named)) => named.to_string(),
+                (None, None) => {
+                    warn!("Discarding an unrequested snapshot recovery that names no collection");
+                    return;
+                }
+            };
 
             client
-                .apply_recovered_collection(&asked, &request_id, generation, recovery)
+                .apply_recovered_collection(
+                    &name,
+                    matched.then_some(request_id.as_str()),
+                    recovery,
+                )
                 .await;
         }));
     }
@@ -2845,34 +2851,286 @@ mod tests {
             );
         }
 
+        type RecoveryResponse = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse;
+
+        const RECOVERY_KEY_ID: &[u8] = b"recovery-test-key";
+        const RECOVERY_KEY: [u8; 32] = [7; 32];
+        const OLD_INDEX_MAC: &[u8] = b"index-mac-before-the-recovery";
+
+        /// `regular_low` at `version`, with an ltHash, a MAC row and the key
+        /// the replies below are signed with.
+        async fn seed_regular_low(client: &Arc<Client>, version: u64) {
+            let backend = client.persistence_manager.backend();
+            backend
+                .set_sync_key(
+                    RECOVERY_KEY_ID,
+                    wacore::store::traits::AppStateSyncKey {
+                        key_data: RECOVERY_KEY.to_vec(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            backend
+                .set_version(
+                    "regular_low",
+                    wacore::appstate::hash::HashState {
+                        version,
+                        hash: [0x11; 128],
+                        bootstrapped: true,
+                        mac_mismatch_fatal: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            backend
+                .put_mutation_macs(
+                    "regular_low",
+                    version,
+                    &[wacore::appstate::processor::AppStateMutationMAC {
+                        index_mac: OLD_INDEX_MAC.to_vec(),
+                        value_mac: vec![0x22; 32],
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+
+        /// The primary's `regular_low` at `version`: one mute record for `chat`,
+        /// and the ltHash byte and value MAC byte that identify this reply.
+        fn regular_low_reply(version: u64, chat: &str, mark: u8) -> RecoveryResponse {
+            use buffa::Message as _;
+            let mut record = wa::SyncdPlainTextRecord::default();
+            record.value = buffa::MessageField::some({
+                let mut data = wa::SyncActionData::default();
+                data.index = Some(format!(r#"["mute","{chat}"]"#).into_bytes());
+                data.value = buffa::MessageField::some({
+                    let mut value = wa::SyncActionValue::default();
+                    value.mute_action = buffa::MessageField::some({
+                        let mut mute = wa::sync_action_value::MuteAction::default();
+                        mute.muted = Some(true);
+                        mute
+                    });
+                    value
+                });
+                data
+            });
+            record.key_id = Some(RECOVERY_KEY_ID.to_vec());
+            record.mac = Some(vec![mark; 32]);
+            let mut recovery = wa::SyncdSnapshotRecovery::default();
+            recovery.collection_name = Some("regular_low".to_string());
+            recovery.version = buffa::MessageField::some({
+                let mut v = wa::SyncdVersion::default();
+                v.version = Some(version);
+                v
+            });
+            recovery.collection_lthash = Some(vec![mark; 128]);
+            recovery.mutation_records = vec![record];
+            let mut response = RecoveryResponse::default();
+            response.collection_snapshot = Some(recovery.encode_to_vec());
+            response.is_compressed = Some(false);
+            response
+        }
+
+        async fn regular_low_state(client: &Arc<Client>) -> wacore::appstate::hash::HashState {
+            client
+                .persistence_manager
+                .backend()
+                .get_version("regular_low")
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn regular_low_mac(client: &Arc<Client>, index_mac: &[u8]) -> Option<Vec<u8>> {
+            client
+                .persistence_manager
+                .backend()
+                .get_mutation_mac("regular_low", index_mac)
+                .await
+                .unwrap()
+        }
+
+        fn mute_index_mac(chat: &str) -> Vec<u8> {
+            let keys = wacore::appstate::keys::expand_app_state_keys(&RECOVERY_KEY);
+            wacore::appstate::hash::generate_index_mac(
+                format!(r#"["mute","{chat}"]"#).as_bytes(),
+                &keys.index,
+            )
+        }
+
+        /// Hands every reply to the handler while the recovery lock is held, so
+        /// all of them are in flight together, checks that `spawned` of them
+        /// queued for a decode, and waits for every one to finish.
+        ///
+        /// Each spawned reply holds a handle to the lock while it waits for it
+        /// and while it runs, so the handle count is the replies in flight.
+        async fn deliver_together(
+            client: &Arc<Client>,
+            replies: &[(&RecoveryResponse, &str)],
+            spawned: usize,
+        ) {
+            let held = client.snapshot_recovery_lock.lock().await;
+            for (reply, request_id) in replies {
+                client
+                    .handle_syncd_snapshot_recovery_response(reply, request_id)
+                    .await;
+                // Lets the reply just spawned reach the lock before the next
+                // one is handed over, so they queue in arrival order.
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            assert_eq!(
+                Arc::strong_count(&client.snapshot_recovery_lock),
+                1 + spawned,
+                "replies queued for a decode"
+            );
+            drop(held);
+            crate::test_utils::poll_until("every recovery reply to finish", || {
+                Arc::strong_count(&client.snapshot_recovery_lock) == 1
+            })
+            .await;
+        }
+
         #[tokio::test]
-        async fn retired_recovery_reply_is_released_before_decode_is_scheduled() {
+        async fn a_recovery_reply_nothing_asked_for_is_applied_when_it_moves_the_collection() {
             let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "asked-by-an-earlier-process")], 1).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 8, "the primary's version replaces ours");
+            assert_eq!(state.hash, [0x5A; 128], "and so does its ltHash");
+            assert!(!state.mac_mismatch_fatal);
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("1@s.whatsapp.net")).await,
+                Some(vec![0x5A; 32]),
+                "the record's MAC is stored"
+            );
+            assert_eq!(
+                regular_low_mac(&client, OLD_INDEX_MAC).await,
+                None,
+                "and the MACs of the collection it replaced are gone"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_recovery_reply_to_an_ask_from_an_older_connection_is_applied() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
             let proc = client.get_app_state_processor();
             let generation = client
                 .connection_generation
                 .load(std::sync::atomic::Ordering::Acquire);
             assert!(
-                proc.mark_recovery_requested_with_id("regular_low", generation, "retired")
-                    .await
+                proc.mark_recovery_requested_with_id(
+                    "regular_low",
+                    generation,
+                    "asked-before-reconnect"
+                )
+                .await
             );
             client
                 .connection_generation
                 .store(generation + 1, std::sync::atomic::Ordering::Release);
-            let mut response = wa::message::peer_data_operation_request_response_message::peer_data_operation_result::SyncDSnapshotFatalRecoveryResponse::default();
-            response.collection_snapshot = Some(vec![255; 32]);
-            response.is_compressed = Some(true);
-            client
-                .handle_syncd_snapshot_recovery_response(&response, "retired")
-                .await;
+
+            let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "asked-before-reconnect")], 1).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 8, "applied under the current connection");
+            assert_eq!(state.hash, [0x5A; 128]);
             assert!(
                 !proc.has_recovery_request("regular_low").await,
-                "retired reply is consumed synchronously, before a decode job can run"
+                "the ask it answered is spent"
             );
             assert!(
-                proc.mark_recovery_requested_with_id("regular_low", generation + 1, "replacement")
+                proc.mark_recovery_requested_with_id("regular_low", generation + 1, "next")
+                    .await,
+                "and does not suppress the next one"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_recovery_reply_behind_the_collection_is_discarded_and_releases_the_ask() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 10).await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation, "newest-ask")
                     .await
             );
+
+            let reply = regular_low_reply(10, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "an-older-ask")], 1).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 10, "the stored version stands");
+            assert_eq!(state.hash, [0x11; 128], "and so does its ltHash");
+            assert_eq!(
+                regular_low_mac(&client, OLD_INDEX_MAC).await,
+                Some(vec![0x22; 32]),
+                "and its MACs"
+            );
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("1@s.whatsapp.net")).await,
+                None
+            );
+            assert!(
+                !proc.has_recovery_request("regular_low").await,
+                "an answer found behind still settles the outstanding ask"
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_replies_arriving_together_apply_one_after_the_other() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let first = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            let second = regular_low_reply(8, "2@s.whatsapp.net", 0x6B);
+            deliver_together(&client, &[(&first, "first"), (&second, "second")], 2).await;
+
+            let state = regular_low_state(&client).await;
+            assert_eq!(state.version, 8);
+            assert_eq!(
+                state.hash, [0x5A; 128],
+                "the first reply's collection stands"
+            );
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("1@s.whatsapp.net")).await,
+                Some(vec![0x5A; 32])
+            );
+            assert_eq!(
+                regular_low_mac(&client, &mute_index_mac("2@s.whatsapp.net")).await,
+                None,
+                "the second, at the same version, was discarded as stale"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_repeat_of_a_recovery_reply_being_handled_costs_no_decode() {
+            let (client, _, _) = manual_retry_client().await;
+            seed_regular_low(&client, 5).await;
+            let proc = client.get_app_state_processor();
+            let generation = client
+                .connection_generation
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                proc.mark_recovery_requested_with_id("regular_low", generation, "asked")
+                    .await
+            );
+
+            let reply = regular_low_reply(8, "1@s.whatsapp.net", 0x5A);
+            deliver_together(&client, &[(&reply, "asked"), (&reply, "asked")], 1).await;
+
+            assert_eq!(regular_low_state(&client).await.version, 8);
+            assert!(!proc.has_recovery_request("regular_low").await);
         }
 
         #[tokio::test]
