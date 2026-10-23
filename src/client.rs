@@ -2078,22 +2078,34 @@ pub struct Client {
     /// a time bounds that to one inflated collection in memory, and lets each
     /// reply after the first find the collection already moved and be
     /// discarded by the version check rather than racing it. Locked through
-    /// `lock_arc`, so the count of handles is the count of replies in flight.
+    /// `lock_arc`, so the count of handles is the count of tasks holding or
+    /// waiting for it: one per matched reply, and one drainer for however many
+    /// unrequested replies are queued behind it.
     pub(crate) snapshot_recovery_lock: Arc<Mutex<()>>,
-    /// Unrequested snapshot recoveries: the one being applied, and at most one
-    /// waiting behind it, which the newest arrival replaces.
+    /// Unrequested snapshot recoveries waiting, in arrival order, behind the
+    /// one task that applies them.
     ///
     /// The lock above bounds the decodes to one, not the copies: a reply's
     /// payload is copied off the inbound lane before anything waits for the
     /// lock, so a burst of unrequested replies would each hold a
     /// collection-sized copy while it waited. A matched reply is bounded by its
     /// claim -- one per ask -- but nothing bounds replies nobody asked for.
-    /// Turning the extra ones away would bound them too, but it would drop the
-    /// wrong ones: a burst answers asks made at different times, so the last to
-    /// arrive carries the primary's newest state, and every reply before it is
-    /// at best the same collection at an older version. One waiting slot that
-    /// the newest arrival overwrites keeps two copies in memory and never drops
-    /// the newest reply. A sync mutex, held only for a swap.
+    ///
+    /// No admitted reply is ever dropped or replaced before it is decoded:
+    /// which collection a reply is for is inside the payload, so any reply
+    /// discarded unread can be the only one for its collection. Every one is
+    /// applied in turn, and the older ones end as stale. What bounds the copies
+    /// is admission instead -- a count, and a byte budget of one reply of the
+    /// largest size the decode accepts, which one reply may always use. A
+    /// reply refused there is dropped before anything reads which collection
+    /// it was for, so a refusal marks the queue, and once it drains every
+    /// collection a recovery can be for is scheduled to sync again (see
+    /// `Client::converge_after_dropped_recovery`): one still stuck fails as
+    /// before and asks the primary again. An admitted reply that fails to
+    /// decode cannot be read either, but gets no such sync: the primary's
+    /// answer to the ask that sync would end in is likely the same unreadable
+    /// reply, so it would only loop. A sync mutex, held only to admit (and
+    /// copy) a reply or take one.
     pub(crate) unrequested_snapshot_recoveries:
         std::sync::Mutex<crate::pdo::UnrequestedRecoveryQueue>,
     pub(crate) initial_keys_synced_notifier: Arc<event_listener::Event>,

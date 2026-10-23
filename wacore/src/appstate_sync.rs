@@ -1604,7 +1604,11 @@ impl AppStateProcessor {
 /// incoming snapshot's; WA Web discards it ("skip applying syncd old version") rather
 /// than rolling the collection backward. The `persisted_version > 0` guard keeps the
 /// benign first-sync path (snapshots are requested only at version 0) unaffected.
-fn snapshot_is_stale(persisted_version: u64, snapshot_version: u64) -> bool {
+///
+/// Public so a caller can turn a stale recovery away before paying for it; the
+/// check inside [`AppStateProcessor::apply_snapshot_recovery`] stays the one
+/// that decides.
+pub fn snapshot_is_stale(persisted_version: u64, snapshot_version: u64) -> bool {
     persisted_version > 0 && snapshot_version <= persisted_version
 }
 

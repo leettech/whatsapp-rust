@@ -3818,8 +3818,8 @@ fn client_size_pins_runtime_cache_config_saving() {
     expected -= size_of::<std::sync::OnceLock<HashMap<String, Arc<dyn EncHandler>>>>()
         - size_of::<Option<HashMap<String, Arc<dyn EncHandler>>>>();
     // Snapshot recoveries from the primary are applied one at a time behind a
-    // shared lock, with one unrequested reply waiting in an inline slot; count
-    // their representations rather than raising the fixed base.
+    // shared lock, with unrequested replies queued behind an inline mutex;
+    // count their representations rather than raising the fixed base.
     expected += size_of::<Arc<Mutex<()>>>()
         + size_of::<std::sync::Mutex<crate::pdo::UnrequestedRecoveryQueue>>();
     // The detached storage owner now also owns the reusable arena, replacing
