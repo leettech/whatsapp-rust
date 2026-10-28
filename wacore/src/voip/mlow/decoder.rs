@@ -24,6 +24,11 @@ const OPUS_FRAME_SAMPS: usize = 960; // 60 ms @ 16 kHz
 /// The decoder synthesises at 16 kHz regardless of the internal rate a TOC declares.
 const OUTPUT_SAMPLES_PER_MS: i32 = 16;
 
+/// Per-repeat attenuation of the concealment tail: each replayed 20 ms segment of the last good
+/// audio is scaled down this much against the previous one, so a sustained loss decays toward
+/// silence instead of looping the last phoneme forever.
+const PLC_FADE: f32 = 0.85;
+
 /// The longest audio one packet may carry, in samples at 16 kHz.
 ///
 /// 120 ms, which is both the longest duration a TOC can declare and the ceiling the shipped
@@ -120,6 +125,10 @@ pub struct MlowDecoder {
     /// a SID, a drop or a standard-Opus escape emits a fixed slot regardless of duration. Consumers
     /// sizing a jitter cushion need the declared value, since that is what sets arrival cadence.
     last_packet_samps: usize,
+    /// Tail of the last successfully decoded audio, the raw material for packet-loss concealment
+    /// (see [`MlowDecoder::conceal`]). Bounded to one maximal packet. Updated only on a successful
+    /// decode, so a concealed or dropped frame never feeds back into later concealment.
+    last_good: Vec<f32>,
 }
 
 impl Default for MlowDecoder {
@@ -139,6 +148,7 @@ impl MlowDecoder {
             malformed: 0,
             report: MlowFrameReport::default(),
             last_packet_samps: OPUS_FRAME_SAMPS,
+            last_good: Vec::new(),
         }
     }
 
@@ -174,6 +184,32 @@ impl MlowDecoder {
         self.state = SmplDecoderState::default();
         self.state_backup = SmplDecodeRollback::default();
         self.had_error = false;
+        self.last_good.clear();
+    }
+
+    /// Packet-loss concealment for a frame that produced no audio: replay the last 20 ms of the
+    /// most recent successful decode, attenuating each repeat by [`PLC_FADE`]. A hard run of zeros
+    /// clicks against the surrounding waveform, and at the loss rates in-band FEC exists for it is
+    /// what made the contact's voice choppy (zapbot#4103); a decaying replay reads as a dropout
+    /// instead. With no decode history yet this is silence, exactly as before.
+    ///
+    /// Reads `last_good` only and leaves the decoder state untouched, so concealment stays
+    /// compatible with the `state_backup` rollback: nothing an invented-parameter decode did can
+    /// reach the audio this emits, and nothing this emits can reach the next packet's decode.
+    fn conceal(&self, samps: usize) -> Vec<f32> {
+        let seg_start = self.last_good.len().saturating_sub(SMPL_INTF_LEN);
+        let seg = &self.last_good[seg_start..];
+        if seg.is_empty() {
+            return vec![0.0; samps];
+        }
+        let mut out = Vec::with_capacity(samps);
+        let mut gain = 1.0f32;
+        while out.len() < samps {
+            let take = seg.len().min(samps - out.len());
+            out.extend(seg[..take].iter().map(|&s| s * gain));
+            gain *= PLC_FADE;
+        }
+        out
     }
 
     /// Decode one RTP MLow payload into a PCM frame, float in [-1, 1]. The sample count follows
@@ -182,7 +218,7 @@ impl MlowDecoder {
         self.report = MlowFrameReport::default();
         if payload.is_empty() {
             self.report.concealed = self.report.concealed.saturating_add(1);
-            return vec![0.0; OPUS_FRAME_SAMPS];
+            return self.conceal(OPUS_FRAME_SAMPS);
         }
         if self.redundancy > 0 {
             return match depack_split_red(payload) {
@@ -201,7 +237,7 @@ impl MlowDecoder {
                 Err(e) => {
                     log::warn!("mlow RED depacketization failed: {e:?}");
                     self.report.concealed = self.report.concealed.saturating_add(1);
-                    vec![0.0; OPUS_FRAME_SAMPS]
+                    self.conceal(OPUS_FRAME_SAMPS)
                 }
             };
         }
@@ -239,7 +275,7 @@ impl MlowDecoder {
                 }
                 self.report.concealed = self.report.concealed.saturating_add(1);
                 self.last_packet_samps = OPUS_FRAME_SAMPS;
-                return vec![0.0; OPUS_FRAME_SAMPS];
+                return self.conceal(OPUS_FRAME_SAMPS);
             }
         };
         // Refuse before decoding anything, not while appending: a packet whose sub-frames total
@@ -261,7 +297,7 @@ impl MlowDecoder {
             }
             self.report.concealed = self.report.concealed.saturating_add(1);
             self.last_packet_samps = OPUS_FRAME_SAMPS;
-            return vec![0.0; OPUS_FRAME_SAMPS];
+            return self.conceal(OPUS_FRAME_SAMPS);
         }
 
         let mut out = Vec::with_capacity(declared);
@@ -277,7 +313,7 @@ impl MlowDecoder {
     fn decode_frame(&mut self, frame: &[u8]) -> Vec<f32> {
         if frame.is_empty() {
             self.report.concealed = self.report.concealed.saturating_add(1);
-            return vec![0.0; OPUS_FRAME_SAMPS];
+            return self.conceal(OPUS_FRAME_SAMPS);
         }
         let toc = parse_mlow_toc(frame[0]);
         // In OUTPUT samples, always 16 kHz: the synthesis runs at one rate, so a frame declaring a
@@ -289,11 +325,11 @@ impl MlowDecoder {
         if toc.std_opus {
             let out_len = silence_samps((OUTPUT_SAMPLES_PER_MS * toc.frame_ms) as usize);
             log::debug!(
-                "mlow: standard-opus TOC 0x{:02x} -> {out_len} samples silence",
+                "mlow: standard-opus TOC 0x{:02x} -> {out_len} samples of concealment",
                 frame[0]
             );
             self.report.off_point = self.report.off_point.saturating_add(1);
-            return vec![0.0; out_len];
+            return self.conceal(out_len);
         }
         // A SID (DTX/CNG) frame carries comfort noise rather than coded voice and is silenced without
         // opening the range coder, so its geometry can never desync. Handle it before the
@@ -338,10 +374,10 @@ impl MlowDecoder {
                 );
             }
             self.report.off_point = self.report.off_point.saturating_add(1);
-            return vec![0.0; silence_samps(self.last_packet_samps)];
+            return self.conceal(silence_samps(self.last_packet_samps));
         }
         let frames = frames.expect("the guard above rejected every unsupported duration");
-        self.decode_active_frame(frame, frames * SMPL_INTF_LEN, frames, toc.active)
+        self.decode_active_frame(frame, frames * SMPL_INTF_LEN, frames, toc.active, toc.fec)
     }
 
     /// `coded_as_active_voice` gates two symbols that a frame coded inactive never puts on the wire;
@@ -352,6 +388,7 @@ impl MlowDecoder {
         out_len: usize,
         frames: usize,
         coded_as_active_voice: bool,
+        fec: bool,
     ) -> Vec<f32> {
         let config = (frame[0] >> 2) as usize & 1;
         let tbl = load_smpl_tables();
@@ -378,6 +415,21 @@ impl MlowDecoder {
         // And it copies only what this loop can reach: the harmonic postfilter runs after the
         // endpoint check below, so a concealed packet never advanced it. See [`SmplDecodeRollback`].
         self.state_backup.save(&self.state);
+
+        // An in-band FEC packet (TOC fec bit) opens its body with one LBRR copy per internal frame
+        // — the previous packet's audio, re-coded at the FEC pulse budget — ahead of this packet's
+        // own frames, all in the same continuous range-coder stream (the SILK layout, confirmed
+        // against the shipped decoder; see the `mlow_fec` oracle spec). The copy is a stand-in for
+        // a lost previous packet: when that packet arrived, as here, it is decoded only to keep the
+        // range coder aligned with where this packet's own data starts, into a scratch predictor so
+        // it cannot perturb the main decode. Using it to fill a genuinely lost packet is the PLC
+        // path and is not implemented.
+        if fec {
+            let mut lbrr_state = self.state.lstate.clone();
+            for f in 0..frames {
+                decode_lbrr_symbols(&mut dec, tbl, mem, cc, &mut lbrr_state, config, f);
+            }
+        }
 
         let mut out: Vec<f32> = Vec::with_capacity(frames * SMPL_INTF_LEN);
         // Collect the per-40-block lags (8 per internal frame) and the average normalized bitrate
@@ -499,7 +551,7 @@ impl MlowDecoder {
                 );
             }
             self.report.concealed = self.report.concealed.saturating_add(1);
-            return vec![0.0; out_len];
+            return self.conceal(out_len);
         }
         self.report.decoded = self.report.decoded.saturating_add(frames as u8);
 
@@ -519,6 +571,12 @@ impl MlowDecoder {
         for v in &mut out {
             *v = v.clamp(-1.0, 1.0);
         }
+        // Successful decode: this audio is the concealment tail for the next lost frame.
+        self.last_good.extend_from_slice(&out);
+        let excess = self.last_good.len().saturating_sub(MAX_PACKET_SAMPS);
+        if excess > 0 {
+            self.last_good.drain(..excess);
+        }
         if out_len > 0 && out_len != out.len() {
             out.resize(out_len, 0.0);
         }
@@ -532,6 +590,46 @@ impl MlowDecoder {
             out.len()
         );
         out
+    }
+}
+
+/// Consume one internal frame's worth of LBRR (in-band FEC) symbols from the range coder,
+/// discarding the decoded parameters. The symbol sequence is the same as a main internal frame's
+/// (LSF -> pulses -> pitch or gains), so the same block decoders apply; the copy carries fewer
+/// pulses, but the pulse count is read from the stream, not assumed. `st` is a scratch predictor:
+/// an LBRR decode must not move the LSF/pitch predictor the main frames of this packet run on.
+fn decode_lbrr_symbols(
+    dec: &mut RangeDecoder,
+    tbl: &super::smpl_decode::SmplTables,
+    mem: &super::smpl_mem::SmplMem,
+    cc: &super::smpl_cc_tables::CcTables,
+    st: &mut super::smpl_decode::SmplLsfState,
+    config: usize,
+    intf: usize,
+) {
+    let lsf = decode_smpl_lsf(dec, tbl, st, config, intf, true);
+    let pulses = decode_smpl_pulses(
+        dec,
+        cc,
+        SMPL_INTF_LEN as i32,
+        4,
+        1,
+        config as i32,
+        lsf.stage1,
+    );
+    if lsf.stage1 == 1 {
+        decode_smpl_pitch(
+            dec,
+            mem,
+            cc,
+            st,
+            SMPL_INTF_LEN as i32,
+            4,
+            config as i32,
+            pulses.subfr,
+        );
+    } else {
+        decode_smpl_gains(dec, cc, 4, pulses.subfr);
     }
 }
 
@@ -1255,9 +1353,13 @@ mod tests {
     }
 
     // Fail-loud guards: a frame outside our single operating point (32kHz/fullband, or low_rate=1) is
-    // DROPPED to 60ms silence WITHOUT touching the range coder, so it can't desync + poison the
+    // DROPPED to a concealed slot WITHOUT touching the range coder, so it can't desync + poison the
     // cross-frame predictor. A real low_rate=0 frame before and after the drops still decodes (proves
     // the drop is a clean "lost frame", not a desync), and the guards don't false-positive on it.
+    //
+    // The dropped slot is packet-loss concealment, not zeros: with decode history present the drop
+    // replays the last 20 ms under a fade, so the assertions below pin non-silence. Before any
+    // history (see the 10 ms test) concealment is exactly the silence it replaced.
     #[test]
     fn unsupported_frames_drop_clean_without_desync() {
         let frames: Vec<String> =
@@ -1278,17 +1380,17 @@ mod tests {
         let out_32k = dec.decode(&[0x70, 0xAA, 0xBB, 0xCC]);
         assert_eq!(out_32k.len(), 960);
         assert!(
-            out_32k.iter().all(|&s| s == 0.0),
-            "32kHz frame must drop to silence"
+            out_32k.iter().any(|&s| s != 0.0),
+            "a dropped frame after a decoded one is concealed, not silenced"
         );
 
-        // A low_rate=1 TOC -> dropped to 60ms silence. 0x54 = 0b0101_0100: bit5=0 (16kHz, so the rate
+        // A low_rate=1 TOC -> dropped. 0x54 = 0b0101_0100: bit5=0 (16kHz, so the rate
         // branch does NOT catch it), bits4:3=10 (60ms), bit2=1 (low_rate) -> exercises the low_rate branch.
         let out_lr = dec.decode(&[0x54, 0xAA, 0xBB, 0xCC]);
         assert_eq!(out_lr.len(), 960);
         assert!(
-            out_lr.iter().all(|&s| s == 0.0),
-            "low_rate=1 frame must drop to silence"
+            out_lr.iter().any(|&s| s != 0.0),
+            "a dropped frame after a decoded one is concealed, not silenced"
         );
 
         // A 10ms ACTIVE 16kHz/low_rate=0 TOC (0x40) must also drop: it is the one duration whose
@@ -1297,8 +1399,8 @@ mod tests {
         let out_10ms = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
         assert_eq!(out_10ms.len(), 160, "the slot is the declared 10 ms");
         assert!(
-            out_10ms.iter().all(|&s| s == 0.0),
-            "a 10ms active frame must drop to silence"
+            out_10ms.iter().any(|&s| s != 0.0),
+            "a dropped frame after a decoded one is concealed, not silenced"
         );
 
         // The drops never opened the range decoder, so the predictor is intact: the real frame still
@@ -1364,6 +1466,106 @@ mod tests {
         assert!(
             dec.decode(&real).iter().any(|&s| s != 0.0),
             "a real frame must still decode after an inactive frame and a drop"
+        );
+    }
+
+    /// In-band FEC: a stream of `0x52` frames (VAD, 60 ms, low_rate=0, fec=1 — the shape that
+    /// used to be concealed as `concealing malformed frame (TOC 0x52: ...)`) decodes to the
+    /// shipped decoder's own PCM for the same bytes.
+    ///
+    /// Both halves come from the shipped engine (`oracle derive --spec specs/mlow_fec.json`:
+    /// `OPUS_SET_INBAND_FEC(1)` + `OPUS_SET_PACKET_LOSS_PERC(10)`; see testdata/PROVENANCE.md).
+    /// The wasm DECODER decodes the same packets in order, so the reference PCM exercises exactly
+    /// the LBRR-skip layout the decoder implements: one LBRR copy per internal frame, all LBRR
+    /// copies first, sharing the range-coder stream with the main frames that follow them.
+    #[test]
+    fn fec_frames_decode_to_audio_matching_the_oracle() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/mlow_fec_frames.json"))
+                .expect("mlow_fec_frames.json");
+        let refp: Vec<f32> = include_bytes!("testdata/mlow_fec_ref.raw")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .collect();
+
+        let mut dec = MlowDecoder::new();
+        let mut out: Vec<f32> = Vec::new();
+        let mut n_fec = 0usize;
+        let mut concealed = 0u32;
+        for hex_frame in &frames {
+            let frame = hex::decode(hex_frame).unwrap();
+            let toc = parse_mlow_toc(frame[0]);
+            if toc.fec {
+                n_fec += 1;
+                assert_eq!(frame[0], 0x52, "the fixture must stay 0x52 FEC frames");
+            }
+            let start = out.len();
+            out.extend_from_slice(&dec.decode(&frame));
+            assert_eq!(out.len() - start, 960, "every packet is a 60 ms slot");
+            concealed += u32::from(dec.take_frame_report().concealed);
+        }
+        assert!(n_fec >= 90, "fixture lost its FEC frames: {n_fec}");
+        assert_eq!(concealed, 0, "a valid FEC frame must not be concealed");
+        assert_eq!(out.len(), refp.len(), "decode length vs reference");
+
+        let n = refp.len();
+        let (mr, mo) = (
+            refp.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+            out.iter().map(|&v| v as f64).sum::<f64>() / n as f64,
+        );
+        let (mut sxy, mut sxx, mut syy) = (0f64, 0f64, 0f64);
+        for i in 0..n {
+            let (dr, dz) = (refp[i] as f64 - mr, out[i] as f64 - mo);
+            sxy += dr * dz;
+            sxx += dr * dr;
+            syy += dz * dz;
+        }
+        let corr = sxy / (sxx * syy).sqrt();
+        assert!(corr > 0.99, "lag-0 corr {corr:.6} vs shipped reference");
+    }
+
+    /// Packet-loss concealment: a concealed frame replays the tail of the last good decode under a
+    /// per-repeat fade instead of emitting zeros, and with no decode history it stays silence.
+    /// Rollback semantics are preserved: concealment reads no decoder state and advances none, so a
+    /// real frame decoded after a concealed one is identical to one decoded without it (also pinned
+    /// by `a_concealed_frame_does_not_contaminate_the_next`).
+    #[test]
+    fn concealed_frame_replays_last_good_audio_with_fade() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let real = hex::decode(&frames[0]).unwrap();
+        let mut dec = MlowDecoder::new();
+
+        // No history: concealment is silence.
+        let cold = dec.decode(&[]);
+        assert!(cold.iter().all(|&s| s == 0.0));
+
+        let good = dec.decode(&real);
+        assert!(good.iter().any(|&s| s != 0.0));
+
+        let concealed = dec.decode(&[]);
+        assert_eq!(concealed.len(), OPUS_FRAME_SAMPS);
+        let seg = &good[good.len() - SMPL_INTF_LEN..];
+        for rep in 0..3 {
+            let gain = PLC_FADE.powi(rep as i32);
+            for i in 0..SMPL_INTF_LEN {
+                let want = seg[i] * gain;
+                let got = concealed[rep * SMPL_INTF_LEN + i];
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "rep {rep} sample {i}: got {got}, want {want}"
+                );
+            }
+        }
+
+        // The concealment left no state behind: the next real frame decodes as if uninterrupted.
+        let mut uninterrupted = MlowDecoder::new();
+        let _ = uninterrupted.decode(&real);
+        let want_next = uninterrupted.decode(&hex::decode(&frames[1]).unwrap());
+        let got_next = dec.decode(&hex::decode(&frames[1]).unwrap());
+        assert_eq!(
+            got_next, want_next,
+            "concealment must not touch decode state"
         );
     }
 

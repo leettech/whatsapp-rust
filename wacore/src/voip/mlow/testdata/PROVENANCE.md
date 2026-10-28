@@ -46,6 +46,7 @@ is at `attr+1200`, so the old 1184-byte allocation was invalid. The decoder cont
 | `wasm_derived_frames.json` + `wasm_derived_ref.raw` | 110 packets / 110×960 s16le samples; J/S equality | `quality_tests`, `decoder` |
 | `wasm_derived_120ms_frames.json` + `wasm_derived_120ms_ref.raw` | 8 packets / 8×1920 samples; J/S equality | `decoder` |
 | `wasm_derived_vad.json` | 99 active / 11 inactive packets | `smpl_vad` |
+| `mlow_fec_frames.json` + `mlow_fec_ref.raw` | 110 packets (93 with TOC 0x52, in-band FEC) / 110×960 s16le samples | `decoder` |
 | `wasm_fe.cbor.zst` | 330 windows, F2, R, LPC before/after BWE | `smpl_lpc` |
 | `wasm_signal_mode.cbor.zst` | 330 VUV inputs/outputs/states and exact speech-activity probabilities | `smpl_signal_mode`, `smpl_vad` |
 | `wasm_pitch.cbor.zst` | 330 pitch inputs/outputs, predictor state and search configuration | `smpl_pitch_enc` |
@@ -60,6 +61,18 @@ hangover packets are 16, 59 and 61. `0x12` counts as active routing. The explici
 spec executes SET_DTX(0), reads GET_DTX()==0 and retains all 220 packet/PCM hashes. The earlier claim
 that this pair used DTX enabled was incorrect. DTX comparisons feed every packet through the Rust
 decoder before selecting inactive outputs, preserving the reference stream history.
+
+The FEC pair comes from `specs/mlow_fec.json`: `OPUS_SET_INBAND_FEC(1)` plus
+`OPUS_SET_PACKET_LOSS_PERC(10)` (DTX left at its default), the same synth input, and a full-sequence
+decode. 93 of its 110 packets are TOC `0x52` (16 kHz, 60 ms, low_rate=0, fec=1), the shape
+zapbot#4103 reports being concealed. It established the FEC body layout: one LBRR copy per internal
+frame, ALL copies first, sharing the single range-coder stream with the main frames that follow
+(the SILK layout); a main-first or interleaved reading neither ends where the body ends nor matches
+the reference PCM. `specs/mlow_fec_loss.json` repeats the run presenting packet 55 as lost
+(zero-length frame): the shipped decoder answers with its own PLC for 55 and decodes 56 from the
+LBRR copy, the reference for any future LBRR-reconstruction path. Both specs pin every packet and
+PCM output with `assert_sha256`; a higher loss percentage (30) makes the encoder switch to
+low_rate=1 (TOC `0x56`), which this decoder does not implement, so the fixture stays at 10.
 
 Encoder and decoder from one wasm capture are one source, not independent votes. Rust-vs-wasm
 checks coexist with the independent C auditors below. DSP floats use documented tolerances; wire
