@@ -142,8 +142,13 @@ fn playout_bounds(packet_samps: usize) -> (usize, usize) {
 /// rest of the call. Instead it gives up one packet's worth per packet until it reaches the target:
 /// the trim that follows discards at most one packet of the OLDEST queued audio at a time, and a
 /// few packets later the call is back to the latency its current cadence asks for.
-fn effective_playout_cap(current: usize, packet_samps: usize, queued: usize) -> usize {
-    let want = playout_bounds(packet_samps).1;
+fn effective_playout_cap(
+    current: usize,
+    packet_samps: usize,
+    extra: usize,
+    queued: usize,
+) -> usize {
+    let want = adaptive_bounds(packet_samps, extra).1;
     if want >= current || queued <= want {
         want
     } else {
@@ -155,6 +160,89 @@ fn effective_playout_cap(current: usize, packet_samps: usize, queued: usize) -> 
 /// (~200ms) drain whatever is queued instead of holding it (silent) forever. Comfortably above the
 /// few ticks a normal jittered second-frame arrival takes, so it never trips in steady operation.
 const MAX_PRIME_TICKS: u32 = 10;
+/// 300 ms @ 16kHz: the most latency the adaptive cushion may add up to. A mobile path that stalls
+/// longer than this is better heard as a gap than as a conversation running a third of a second
+/// behind. Never below the base ceiling a long peer packet already needs.
+const PLAYOUT_CEILING: usize = 4800;
+/// The cushion grows and relaxes one 60 ms frame at a time: the smallest step that turns the next
+/// stall of the same length into a delay instead of a gap.
+const CUSHION_STEP: usize = OPUS_FRAME_SAMPS_60MS;
+/// 10 s of 20 ms ticks with no network underrun before one step of cushion is given back. Long
+/// enough that a path which stalls every few seconds keeps its cushion, short enough that a call
+/// that got through one bad patch does not carry the latency for the rest of it.
+const CUSHION_RELAX_TICKS: u32 = 500;
+/// Gain kept per concealed 20 ms tick. Gone below audibility after ~200 ms, so a long gap ends
+/// in silence instead of a looped phoneme.
+const CONCEAL_FADE: f32 = 0.7;
+const CONCEAL_FLOOR: f32 = 0.05;
+
+/// [`playout_bounds`] plus the cushion a jittery path has earned, capped at [`PLAYOUT_CEILING`].
+/// The ceiling rises with the target so a burst released after a stall lands in the room the
+/// cushion made for it rather than being trimmed.
+fn adaptive_bounds(packet_samps: usize, extra: usize) -> (usize, usize) {
+    let (target, cap) = playout_bounds(packet_samps);
+    let extra = extra.min(PLAYOUT_CEILING.max(cap) - cap);
+    (target + extra, cap + extra)
+}
+
+/// The part of playout that learns from the path: how much cushion above [`playout_bounds`] it
+/// needs, and what to play while the buffer is dry.
+///
+/// A fixed 120 ms cushion is fine on a wired relay path and wrong on a mobile one, where the
+/// network stalls for a few hundred milliseconds and then releases everything at once: the buffer
+/// runs dry (a gap), re-primes (more gap), and the burst then overflows the ceiling (audio thrown
+/// away). Growing on each underrun the network caused, and relaxing once the path is steady,
+/// spends latency only on the calls that need it.
+#[derive(Debug, Default)]
+struct AdaptivePlayout {
+    extra: usize,
+    steady_ticks: u32,
+    /// The peer's last packet was a SID. A buffer that empties after one is the peer going quiet,
+    /// not the network failing to deliver, and must not grow the cushion.
+    peer_silent: bool,
+    last_frame: Vec<i16>,
+    conceal_gain: f32,
+    underruns: u32,
+}
+
+impl AdaptivePlayout {
+    fn played(&mut self, frame: &[i16]) {
+        self.last_frame.clear();
+        self.last_frame.extend_from_slice(frame);
+        self.conceal_gain = 1.0;
+        self.steady_ticks += 1;
+        if self.steady_ticks >= CUSHION_RELAX_TICKS {
+            self.extra = self.extra.saturating_sub(CUSHION_STEP);
+            self.steady_ticks = 0;
+        }
+    }
+
+    fn underran(&mut self, packet_samps: usize) {
+        if self.peer_silent {
+            return;
+        }
+        self.underruns = self.underruns.saturating_add(1);
+        self.steady_ticks = 0;
+        let room = adaptive_bounds(packet_samps, usize::MAX).0 - playout_bounds(packet_samps).0;
+        self.extra = (self.extra + CUSHION_STEP).min(room);
+    }
+
+    /// Pads `frame` to a full slice with the last slice heard, faded. Reads no decoder state, so
+    /// nothing invented here reaches the next decode.
+    fn conceal_into(&mut self, frame: &mut Vec<i16>) {
+        let gain = self.conceal_gain;
+        frame.extend((frame.len()..PLAYOUT_DRAIN).map(|i| {
+            self.last_frame
+                .get(i)
+                .map_or(0, |&s| (f32::from(s) * gain) as i16)
+        }));
+        self.conceal_gain = if gain * CONCEAL_FADE < CONCEAL_FLOOR {
+            0.0
+        } else {
+            gain * CONCEAL_FADE
+        };
+    }
+}
 /// One-byte mlow DTX comfort-noise token sent on a muted (exact-zero) mic frame so the media stream
 /// never gaps; protect_audio frames it with the DTX RTP header and the peer decodes it to silence.
 #[cfg(feature = "voip-mlow")]
@@ -756,6 +844,7 @@ struct PcmAudioState {
     /// Latency ceiling in force, tracked rather than recomputed so it can lag a shrinking packet
     /// until the backlog drains; see [`effective_playout_cap`].
     playout_cap: usize,
+    adaptive: AdaptivePlayout,
 }
 
 /// The video half of the media plane. No jitter buffer or playout tick: an AU is handed to the
@@ -1287,6 +1376,7 @@ impl CallEngine {
                     priming_ticks: 0,
                     packet_samps: OPUS_FRAME_SAMPS_60MS,
                     playout_cap: playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                    adaptive: AdaptivePlayout::default(),
                 }),
                 playout_deadline: NEVER,
             })
@@ -2504,13 +2594,20 @@ impl CallEngine {
                     // its own contract -- and the arriving-packet sites are what maintain it.
                     // Recomputing on the 20ms tick as well is a second caller of a per-packet
                     // decision, which is inconsistent whether or not a fixture can catch it.
-                    drain_playout(
+                    let underruns = pcm.adaptive.underruns;
+                    let frame = drain_playout(
                         &mut pcm.jitter,
                         &mut pcm.priming,
                         &mut pcm.priming_ticks,
                         pcm.packet_samps,
                         pcm.playout_cap,
-                    )
+                        &mut pcm.adaptive,
+                    );
+                    self.media_stats.playout_underruns = self
+                        .media_stats
+                        .playout_underruns
+                        .saturating_add(pcm.adaptive.underruns - underruns);
+                    frame
                 } else {
                     Vec::new()
                 };
@@ -3504,12 +3601,17 @@ impl CallEngine {
                 if let Some(pcm) = m.pcm.as_mut() {
                     pcm.packet_samps = samples.max(1);
                     pcm.last_packet_decoded = decoded_ok;
+                    pcm.adaptive.peer_silent = false;
                     pcm.jitter.extend(m.foreign_pcm.iter().copied());
                     // Same feed-side ceiling the MLOW path enforces below. A rescued stream is
                     // still a stream: a burst arriving between two playout ticks must not grow the
                     // buffer without bound just because the samples came from another codec.
-                    pcm.playout_cap =
-                        effective_playout_cap(pcm.playout_cap, pcm.packet_samps, pcm.jitter.len());
+                    pcm.playout_cap = effective_playout_cap(
+                        pcm.playout_cap,
+                        pcm.packet_samps,
+                        pcm.adaptive.extra,
+                        pcm.jitter.len(),
+                    );
                     if pcm.jitter.len() > pcm.playout_cap {
                         let drop_n = pcm.jitter.len() - pcm.playout_cap;
                         pcm.jitter.drain(..drop_n);
@@ -3665,14 +3767,20 @@ impl CallEngine {
             // honoured it, so the queue holds what the peer meant rather than a failure's residue.
             pcm.last_packet_decoded =
                 decode_report.decoded > 0 || decode_report.inactive_or_sid > 0;
+            pcm.adaptive.peer_silent =
+                decode_report.inactive_or_sid > 0 && decode_report.decoded == 0;
         }
         // Bound the buffer on the feed side too: a burst of inbound packets arriving between two 20ms
         // playout ticks must not grow `jitter` without limit (drain_playout's cap only runs on a
         // tick). Drop oldest past the same ceiling the drain path uses.
         #[cfg(feature = "voip-mlow")]
         {
-            pcm.playout_cap =
-                effective_playout_cap(pcm.playout_cap, pcm.packet_samps, pcm.jitter.len());
+            pcm.playout_cap = effective_playout_cap(
+                pcm.playout_cap,
+                pcm.packet_samps,
+                pcm.adaptive.extra,
+                pcm.jitter.len(),
+            );
             if pcm.jitter.len() > pcm.playout_cap {
                 let drop_n = pcm.jitter.len() - pcm.playout_cap;
                 pcm.jitter.drain(..drop_n);
@@ -4443,19 +4551,21 @@ fn next_tick(deadline: Millis, now: Millis, interval: Millis) -> Millis {
 }
 
 /// Drain one 20ms playout slice. Caps the buffer at the latency ceiling, then while priming holds
-/// silence WITHOUT draining until the cushion reaches `PLAYOUT_TARGET`; once primed it takes up to
+/// the buffer WITHOUT draining until the cushion reaches the target; once primed it takes up to
 /// `PLAYOUT_DRAIN` samples and re-arms priming on an underrun, so a late packet costs one clean
-/// re-prime rather than a silence pad every tick. Priming also gives up after `MAX_PRIME_TICKS` if
-/// the buffer holds some audio but never reaches the target (the peer sent one frame then went DTX),
-/// flushing it instead of stalling silent forever.
+/// re-prime rather than a pad every tick. Priming also gives up after `MAX_PRIME_TICKS` if the
+/// buffer holds some audio but never reaches the target (the peer sent one frame then went DTX),
+/// flushing it instead of stalling forever. Whatever a slice is short of, while priming or on an
+/// underrun, is concealed by [`AdaptivePlayout`], which also grows the target after an underrun.
 fn drain_playout(
     jitter: &mut VecDeque<i16>,
     priming: &mut bool,
     priming_ticks: &mut u32,
     packet_samps: usize,
     cap: usize,
+    adaptive: &mut AdaptivePlayout,
 ) -> Vec<i16> {
-    let target = playout_bounds(packet_samps).0;
+    let target = adaptive_bounds(packet_samps, adaptive.extra).0;
     if jitter.len() > cap {
         let drop_n = jitter.len() - cap;
         jitter.drain(..drop_n);
@@ -4477,7 +4587,9 @@ fn drain_playout(
             } else {
                 *priming_ticks + 1
             };
-            return vec![0; PLAYOUT_DRAIN];
+            let mut frame = Vec::with_capacity(PLAYOUT_DRAIN);
+            adaptive.conceal_into(&mut frame);
+            return frame;
         }
     }
     let take = jitter.len().min(PLAYOUT_DRAIN);
@@ -4485,7 +4597,10 @@ fn drain_playout(
     if frame.len() < PLAYOUT_DRAIN {
         *priming = true;
         *priming_ticks = 0;
-        frame.resize(PLAYOUT_DRAIN, 0);
+        adaptive.underran(packet_samps);
+        adaptive.conceal_into(&mut frame);
+    } else {
+        adaptive.played(&frame);
     }
     frame
 }
@@ -7291,7 +7406,8 @@ mod tests {
                 &mut priming,
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
-                playout_bounds(OPUS_FRAME_SAMPS_60MS).1
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                &mut AdaptivePlayout::default(),
             )
             .iter()
             .all(|&s| s == 0),
@@ -7306,7 +7422,8 @@ mod tests {
                 &mut priming,
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
-                playout_bounds(OPUS_FRAME_SAMPS_60MS).1
+                playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                &mut AdaptivePlayout::default(),
             )
             .iter()
             .any(|&s| s != 0),
@@ -7337,7 +7454,7 @@ mod tests {
         );
 
         // The shorter packet arrives: the ceiling must not drop below what is already queued.
-        cap = effective_playout_cap(cap, SMALL, queued);
+        cap = effective_playout_cap(cap, SMALL, 0, queued);
         assert!(
             cap >= queued,
             "shrinking to {cap} would discard {} queued samples",
@@ -7345,7 +7462,7 @@ mod tests {
         );
 
         // Once the backlog has drained under the smaller bound, the ceiling follows it down.
-        cap = effective_playout_cap(cap, SMALL, small_cap - 320);
+        cap = effective_playout_cap(cap, SMALL, 0, small_cap - 320);
         assert_eq!(cap, small_cap, "the ceiling must not stay large forever");
     }
 
@@ -7364,7 +7481,14 @@ mod tests {
         // empty again exactly when the next one is due, leaving nothing for a late arrival.
         let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
         feed_120(&mut buf);
-        let first = drain_playout(&mut buf, &mut priming, &mut ticks, P, playout_bounds(P).1);
+        let first = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            P,
+            playout_bounds(P).1,
+            &mut AdaptivePlayout::default(),
+        );
         assert!(
             first.iter().all(|&s| s == 0),
             "a single 120ms packet is a zero cushion; playout must keep priming"
@@ -7373,7 +7497,14 @@ mod tests {
         // Two in flight must survive: the ceiling has to hold the cushion it just asked for.
         feed_120(&mut buf);
         let before = buf.len();
-        let _ = drain_playout(&mut buf, &mut priming, &mut ticks, P, playout_bounds(P).1);
+        let _ = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            P,
+            playout_bounds(P).1,
+            &mut AdaptivePlayout::default(),
+        );
         assert!(
             buf.len() + PLAYOUT_DRAIN >= before,
             "the latency ceiling trimmed the 120ms cushion: {before} -> {} samples",
@@ -7399,7 +7530,7 @@ mod tests {
         let mut cap = big_cap;
         let mut steps = 0;
         while cap > small_cap {
-            let next = effective_playout_cap(cap, SMALL, queued);
+            let next = effective_playout_cap(cap, SMALL, 0, queued);
             assert!(
                 next < cap,
                 "the ceiling has to keep falling, stuck at {cap}"
@@ -7415,9 +7546,9 @@ mod tests {
         assert_eq!(cap, small_cap, "it settles exactly on the new target");
 
         // The other direction is immediate: a longer packet needs its cushion on arrival.
-        assert_eq!(effective_playout_cap(small_cap, BIG, queued), big_cap);
+        assert_eq!(effective_playout_cap(small_cap, BIG, 0, queued), big_cap);
         // And a backlog that already fits takes the new ceiling at once, with nothing to trim.
-        assert_eq!(effective_playout_cap(big_cap, SMALL, 0), small_cap);
+        assert_eq!(effective_playout_cap(big_cap, SMALL, 0, 0), small_cap);
     }
 
     #[test]
@@ -7473,6 +7604,7 @@ mod tests {
                     &mut priming_ticks,
                     OPUS_FRAME_SAMPS_60MS,
                     playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                    &mut AdaptivePlayout::default(),
                 )
                 .iter()
                 .any(|&s| s != 0)
@@ -7482,6 +7614,293 @@ mod tests {
             midstream_silence(&real),
             0,
             "prebuffer must absorb the inter-arrival jitter with no mid-stream silence"
+        );
+    }
+
+    fn rms(frame: &[i16]) -> f32 {
+        (frame.iter().map(|&s| f32::from(s).powi(2)).sum::<f32>() / frame.len().max(1) as f32)
+            .sqrt()
+    }
+
+    /// Primes on two 60 ms frames and plays both out, leaving the buffer empty and primed-off.
+    fn play_two_frames(
+        buf: &mut VecDeque<i16>,
+        priming: &mut bool,
+        ticks: &mut u32,
+        adaptive: &mut AdaptivePlayout,
+    ) {
+        feed_frame(buf);
+        feed_frame(buf);
+        for _ in 0..6 {
+            let cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, adaptive.extra).1;
+            let _ = drain_playout(buf, priming, ticks, OPUS_FRAME_SAMPS_60MS, cap, adaptive);
+        }
+        assert!(
+            buf.is_empty() && !*priming,
+            "the premise: both frames played out"
+        );
+    }
+
+    #[test]
+    fn a_network_underrun_grows_the_cushion_by_one_packet() {
+        let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
+        let mut adaptive = AdaptivePlayout::default();
+        play_two_frames(&mut buf, &mut priming, &mut ticks, &mut adaptive);
+        assert_eq!(
+            adaptive.extra, 0,
+            "a stream that never ran dry keeps the base cushion"
+        );
+
+        let cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, adaptive.extra).1;
+        let _ = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            OPUS_FRAME_SAMPS_60MS,
+            cap,
+            &mut adaptive,
+        );
+        assert!(priming, "running dry re-arms priming");
+        assert_eq!(adaptive.extra, CUSHION_STEP);
+        assert_eq!(adaptive.underruns, 1);
+
+        // Re-priming now waits for three frames instead of two.
+        feed_frame(&mut buf);
+        feed_frame(&mut buf);
+        let cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, adaptive.extra).1;
+        let _ = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            OPUS_FRAME_SAMPS_60MS,
+            cap,
+            &mut adaptive,
+        );
+        assert_eq!(buf.len(), 1920, "two frames no longer end priming");
+        feed_frame(&mut buf);
+        let _ = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            OPUS_FRAME_SAMPS_60MS,
+            cap,
+            &mut adaptive,
+        );
+        assert!(!priming, "the grown cushion is reached and playout resumes");
+    }
+
+    /// A peer in DTX stops sending because it has nothing to say. The buffer empties exactly as it
+    /// does on a stall, but the network did nothing wrong and the latency must not pay for it.
+    #[test]
+    fn a_dtx_gap_does_not_grow_the_cushion() {
+        let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
+        let mut adaptive = AdaptivePlayout::default();
+        play_two_frames(&mut buf, &mut priming, &mut ticks, &mut adaptive);
+        adaptive.peer_silent = true;
+
+        let cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, adaptive.extra).1;
+        let _ = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            OPUS_FRAME_SAMPS_60MS,
+            cap,
+            &mut adaptive,
+        );
+        assert!(priming);
+        assert_eq!(adaptive.extra, 0);
+        assert_eq!(
+            adaptive.underruns, 0,
+            "a silent peer is not a network underrun"
+        );
+    }
+
+    #[test]
+    fn the_cushion_never_grows_past_the_latency_ceiling() {
+        for packet in [320, OPUS_FRAME_SAMPS_60MS, 1920] {
+            let mut adaptive = AdaptivePlayout::default();
+            for _ in 0..50 {
+                adaptive.underran(packet);
+            }
+            let (target, cap) = adaptive_bounds(packet, adaptive.extra);
+            let base_cap = playout_bounds(packet).1;
+            assert_eq!(
+                cap,
+                PLAYOUT_CEILING.max(base_cap),
+                "{packet}-sample packets"
+            );
+            assert!(
+                target + PLAYOUT_DRAIN <= cap,
+                "the target must leave room to drain"
+            );
+        }
+    }
+
+    #[test]
+    fn a_steady_stream_gives_the_cushion_back() {
+        let mut adaptive = AdaptivePlayout {
+            extra: 2 * CUSHION_STEP,
+            ..AdaptivePlayout::default()
+        };
+        let frame = [100i16; PLAYOUT_DRAIN];
+        for _ in 0..CUSHION_RELAX_TICKS - 1 {
+            adaptive.played(&frame);
+        }
+        assert_eq!(
+            adaptive.extra,
+            2 * CUSHION_STEP,
+            "not before the stream proved steady"
+        );
+        adaptive.played(&frame);
+        assert_eq!(
+            adaptive.extra, CUSHION_STEP,
+            "one packet back per steady window"
+        );
+
+        for _ in 0..CUSHION_RELAX_TICKS - 1 {
+            adaptive.played(&frame);
+        }
+        adaptive.underran(OPUS_FRAME_SAMPS_60MS);
+        adaptive.played(&frame);
+        assert_eq!(
+            adaptive.extra,
+            2 * CUSHION_STEP,
+            "an underrun restarts the steady window instead of being forgotten"
+        );
+    }
+
+    /// Zeros between two stretches of audio click and read as a dropout. The gap replays what was
+    /// just heard, fading out, and a long gap still ends in silence rather than a looped phoneme.
+    #[test]
+    fn an_underrun_conceals_with_the_last_audio_and_fades_to_silence() {
+        let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
+        let mut adaptive = AdaptivePlayout::default();
+        play_two_frames(&mut buf, &mut priming, &mut ticks, &mut adaptive);
+        let heard = rms(&adaptive.last_frame);
+        assert!(heard > 0.0);
+
+        let gap: Vec<Vec<i16>> = (0..15)
+            .map(|_| {
+                let cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, adaptive.extra).1;
+                drain_playout(
+                    &mut buf,
+                    &mut priming,
+                    &mut ticks,
+                    OPUS_FRAME_SAMPS_60MS,
+                    cap,
+                    &mut adaptive,
+                )
+            })
+            .collect();
+        assert!(gap.iter().all(|f| f.len() == PLAYOUT_DRAIN));
+        assert!(
+            rms(&gap[0]) > 0.5 * heard,
+            "the gap opens on the audio just heard"
+        );
+        assert!(rms(&gap[4]) < rms(&gap[0]), "and fades");
+        assert!(
+            gap[10..].iter().all(|f| f.iter().all(|&s| s == 0)),
+            "a gap of 200 ms is silence by then, not a loop"
+        );
+    }
+
+    #[test]
+    fn concealment_without_history_is_silence() {
+        let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
+        let mut adaptive = AdaptivePlayout::default();
+        let cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, 0).1;
+        let first = drain_playout(
+            &mut buf,
+            &mut priming,
+            &mut ticks,
+            OPUS_FRAME_SAMPS_60MS,
+            cap,
+            &mut adaptive,
+        );
+        assert!(
+            first.iter().all(|&s| s == 0),
+            "nothing was heard yet, so nothing is replayed"
+        );
+    }
+
+    /// The mobile-network shape: packets every 60 ms, then the path stalls for 200 ms and releases
+    /// what it held in one burst. A fixed 120 ms cushion runs dry on every stall and then trims the
+    /// burst at its ceiling, so each stall costs both a gap and audio. The adaptive cushion pays for
+    /// the first stalls, one frame of cushion each, and absorbs the ones after. It takes three: the
+    /// buffer level swings a whole 60 ms packet below the target between arrivals, so riding out a
+    /// 200 ms stall needs the target near 260 ms.
+    #[test]
+    fn repeated_stalls_are_absorbed_once_the_cushion_has_grown() {
+        const STALLS: [usize; 5] = [100, 200, 300, 400, 500];
+        const STALL_TICKS: usize = 10;
+        let arrival = |packet: usize| {
+            let nominal = packet * 3;
+            STALLS
+                .iter()
+                .find(|&&s| (s..s + STALL_TICKS).contains(&nominal))
+                .map_or(nominal, |&s| s + STALL_TICKS)
+        };
+        let run = |adaptive_enabled: bool| {
+            let (mut buf, mut priming, mut ticks) = (VecDeque::new(), true, 0u32);
+            let mut adaptive = AdaptivePlayout::default();
+            let mut cap = adaptive_bounds(OPUS_FRAME_SAMPS_60MS, 0).1;
+            let mut trimmed = 0usize;
+            let mut started = false;
+            let mut gap_ticks = vec![0usize; STALLS.len()];
+            for t in 0..600 {
+                for _ in (0..250).filter(|&p| arrival(p) == t) {
+                    feed_frame(&mut buf);
+                    cap = effective_playout_cap(
+                        cap,
+                        OPUS_FRAME_SAMPS_60MS,
+                        adaptive.extra,
+                        buf.len(),
+                    );
+                    if buf.len() > cap {
+                        trimmed += buf.len() - cap;
+                        buf.drain(..buf.len() - cap);
+                    }
+                }
+                if !adaptive_enabled {
+                    adaptive.extra = 0;
+                }
+                let before = buf.len().min(cap);
+                let _ = drain_playout(
+                    &mut buf,
+                    &mut priming,
+                    &mut ticks,
+                    OPUS_FRAME_SAMPS_60MS,
+                    cap,
+                    &mut adaptive,
+                );
+                let real = before - buf.len() == PLAYOUT_DRAIN;
+                started |= real;
+                if started
+                    && !real
+                    && let Some(i) = STALLS.iter().rposition(|&s| t >= s)
+                {
+                    gap_ticks[i] += 1;
+                }
+            }
+            (gap_ticks, trimmed)
+        };
+
+        let (fixed_gaps, fixed_trimmed) = run(false);
+        assert!(
+            fixed_gaps.iter().all(|&g| g > 0) && fixed_trimmed > 0,
+            "the premise: a fixed cushion breaks on every stall and trims the burst \
+             (gaps {fixed_gaps:?}, trimmed {fixed_trimmed})"
+        );
+
+        let (gaps, trimmed) = run(true);
+        assert_eq!(
+            &gaps[3..],
+            &[0, 0],
+            "once grown, the cushion rides out the stall (gaps per stall {gaps:?})"
+        );
+        assert!(
+            trimmed < fixed_trimmed,
+            "the grown ceiling keeps the burst a fixed one throws away ({trimmed} vs {fixed_trimmed})"
         );
     }
 
@@ -8835,12 +9254,15 @@ mod tests {
             }
         }
         // The number is the assertion because the loss is a prefix of the buffer, not a failure:
-        // purging unconditionally gives 1920 here, keeping what decoded gives 2400. Two 60ms packets
-        // of real speech in this fixture -- less than an unconditional purge costs a call whose
-        // buffer is fuller, and enough to fail if the condition is dropped.
+        // keeping what decoded gives 2400 decoded samples, and purging unconditionally loses 480 of
+        // them -- less than an unconditional purge costs a call whose buffer is fuller, and enough
+        // to fail if the condition is dropped. The 160 on top are concealment: the last slice is
+        // short by 160 samples and is padded with the slice before it at full gain, which in this
+        // constant-valued fixture is 1234 too.
         let decoded = heard.iter().filter(|s| **s == 1234).count();
         assert_eq!(
-            decoded, 2400,
+            decoded,
+            2400 + 160,
             "the packets decoded before the verdict have to survive it"
         );
     }
@@ -11672,6 +12094,7 @@ mod tests {
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
                 playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                &mut AdaptivePlayout::default(),
             );
             max_occupancy = max_occupancy.max(buf.len());
         }
@@ -11691,6 +12114,7 @@ mod tests {
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
                 playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                &mut AdaptivePlayout::default(),
             )
             .iter()
             .any(|&s| s != 0)
@@ -11721,6 +12145,7 @@ mod tests {
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
                 playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                &mut AdaptivePlayout::default(),
             );
             assert!(f.iter().all(|&s| s == 0), "still priming -> silence");
             assert_eq!(
@@ -11736,6 +12161,7 @@ mod tests {
             &mut priming_ticks,
             OPUS_FRAME_SAMPS_60MS,
             playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+            &mut AdaptivePlayout::default(),
         );
         assert!(
             flushed.iter().any(|&s| s != 0),
@@ -11762,6 +12188,7 @@ mod tests {
                 &mut priming_ticks,
                 OPUS_FRAME_SAMPS_60MS,
                 playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+                &mut AdaptivePlayout::default(),
             );
             assert!(f.iter().all(|&s| s == 0), "empty buffer -> silence");
         }
@@ -11773,6 +12200,7 @@ mod tests {
             &mut priming_ticks,
             OPUS_FRAME_SAMPS_60MS,
             playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+            &mut AdaptivePlayout::default(),
         );
         assert!(
             f.iter().all(|&s| s == 0),
@@ -11787,6 +12215,7 @@ mod tests {
             &mut priming_ticks,
             OPUS_FRAME_SAMPS_60MS,
             playout_bounds(OPUS_FRAME_SAMPS_60MS).1,
+            &mut AdaptivePlayout::default(),
         );
         assert!(
             f.iter().any(|&s| s != 0),
