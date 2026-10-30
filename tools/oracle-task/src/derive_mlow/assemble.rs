@@ -212,6 +212,18 @@ pub fn all(out: &Path) -> Result<()> {
     }
     write_json(&dest.join("wasm_derived_120ms_frames.json"), &frames)?;
     write(&dest.join("wasm_derived_120ms_ref.raw"), &pcm)?;
+    frames.clear();
+    pcm.clear();
+    for i in 0..110 {
+        frames.push(hex::encode(std::fs::read(
+            out.join(format!("mlow_fec/packet{i:03}.bin")),
+        )?));
+        pcm.extend(std::fs::read(
+            out.join(format!("mlow_fec/decoded{i:03}.raw")),
+        )?);
+    }
+    write_json(&dest.join("mlow_fec_frames.json"), &frames)?;
+    write(&dest.join("mlow_fec_ref.raw"), &pcm)?;
     type Build = fn(&Path) -> Result<Value>;
     for (leaf, run, build) in [
         ("fe", "fe", fe as Build),

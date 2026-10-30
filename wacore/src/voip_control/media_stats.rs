@@ -342,6 +342,7 @@ fn window_delta(now: &CallMediaStats, then: &CallMediaStats) -> CallMediaStats {
         playout_trimmed_samples: now
             .playout_trimmed_samples
             .saturating_sub(then.playout_trimmed_samples),
+        playout_underruns: now.playout_underruns.saturating_sub(then.playout_underruns),
         inbound_pipe_dropped: now
             .inbound_pipe_dropped
             .saturating_sub(then.inbound_pipe_dropped),

@@ -1,6 +1,14 @@
 {
-  "derivation_lock_sha256": "5fc53f04d7f0f59b334abdfec896b423edd46980360b8bd7c3dfd5c83b6cef6f",
+  "derivation_lock_sha256": "0b0dca83e2663462cbbd67f28529c257be9431afd393b45562bf02e3b8024659",
   "files": {
+    "mlow_fec_frames.json": {
+      "bytes": 21079,
+      "sha256": "c4f114b1e6faf1030bd8138c4e9d6b8393ebee32d0c500da9c95f45cc5711a1d"
+    },
+    "mlow_fec_ref.raw": {
+      "bytes": 211200,
+      "sha256": "92fe528696b2e9f104051d2757022a154047cef2dce8a0293f3574eb4378ae66"
+    },
     "wasm_derived_120ms_frames.json": {
       "bytes": 4087,
       "sha256": "0cf159be86830546b15687e0e61a088c10f7b940fb3806a008c9a3c07cd01304"

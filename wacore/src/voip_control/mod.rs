@@ -580,6 +580,10 @@ pub struct MediaStats {
     pub outbound_frames_without_encoder: u32,
     #[builder(default)]
     pub playout_trimmed_samples: u32,
+    /// Times the playout buffer ran dry while the peer was sending audio: packets the network
+    /// held back past the cushion. Each one grew the cushion by a frame and was concealed.
+    #[builder(default)]
+    pub playout_underruns: u32,
     #[builder(default)]
     pub inbound_pipe_dropped: u32,
     #[builder(default)]
