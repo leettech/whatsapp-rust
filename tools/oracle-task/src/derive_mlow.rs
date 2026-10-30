@@ -13,6 +13,8 @@ const J_RUNS: &[&str] = &[
     "mlow_110frames",
     "mlow_120ms",
     "mlow_dtx_off",
+    "mlow_fec",
+    "mlow_fec_loss",
     "mlow_fe_trace",
     "mlow_signal_trace",
     "mlow_kernel_trace",

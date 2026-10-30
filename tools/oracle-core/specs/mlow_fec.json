@@ -1,6 +1,6 @@
 {
   "comment": [
-    "OPUS_SET_INBAND_FEC(1) + OPUS_SET_PACKET_LOSS_PERC(30), DTX left at the default (on).",
+    "OPUS_SET_INBAND_FEC(1) + OPUS_SET_PACKET_LOSS_PERC(10), DTX left at the default (on).",
     "Encodes synth_mic (110 packets) and decodes the full sequence; packets carrying an LBRR copy surface as TOC 0x52."
   ],
   "module": {
