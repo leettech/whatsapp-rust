@@ -26,8 +26,12 @@ const OUTPUT_SAMPLES_PER_MS: i32 = 16;
 
 /// Per-repeat attenuation of the concealment tail: each replayed 20 ms segment of the last good
 /// audio is scaled down this much against the previous one, so a sustained loss decays toward
-/// silence instead of looping the last phoneme forever.
-const PLC_FADE: f32 = 0.85;
+/// silence instead of looping the last phoneme forever. The fade runs across packets, not within
+/// one: a run of lost packets keeps decaying where the previous one left off.
+const PLC_FADE: f32 = 0.7;
+/// Gain below which the replay is inaudible and concealment emits silence instead. With
+/// [`PLC_FADE`] that is reached after ~180 ms of continuous loss.
+const PLC_FLOOR: f32 = 0.05;
 
 /// The longest audio one packet may carry, in samples at 16 kHz.
 ///
@@ -129,6 +133,14 @@ pub struct MlowDecoder {
     /// (see [`MlowDecoder::conceal`]). Bounded to one maximal packet. Updated only on a successful
     /// decode, so a concealed or dropped frame never feeds back into later concealment.
     last_good: Vec<f32>,
+    /// Gain the next concealed sample is replayed at. Carried across `decode` calls so a run of
+    /// lost packets fades out instead of restarting at full volume on each one; back to 1.0 on the
+    /// next successful decode.
+    conceal_gain: f32,
+    /// Where in the 20 ms replay segment the next concealed sample comes from. Losses shorter than
+    /// the segment (10 ms frames) continue the replay instead of looping its first half, which
+    /// would be a 100 Hz buzz.
+    conceal_pos: usize,
 }
 
 impl Default for MlowDecoder {
@@ -149,6 +161,8 @@ impl MlowDecoder {
             report: MlowFrameReport::default(),
             last_packet_samps: OPUS_FRAME_SAMPS,
             last_good: Vec::new(),
+            conceal_gain: 1.0,
+            conceal_pos: 0,
         }
     }
 
@@ -185,6 +199,8 @@ impl MlowDecoder {
         self.state_backup = SmplDecodeRollback::default();
         self.had_error = false;
         self.last_good.clear();
+        self.conceal_gain = 1.0;
+        self.conceal_pos = 0;
     }
 
     /// Packet-loss concealment for a frame that produced no audio: replay the last 20 ms of the
@@ -193,22 +209,28 @@ impl MlowDecoder {
     /// what made the contact's voice choppy (zapbot#4103); a decaying replay reads as a dropout
     /// instead. With no decode history yet this is silence, exactly as before.
     ///
-    /// Reads `last_good` only and leaves the decoder state untouched, so concealment stays
-    /// compatible with the `state_backup` rollback: nothing an invented-parameter decode did can
-    /// reach the audio this emits, and nothing this emits can reach the next packet's decode.
-    fn conceal(&self, samps: usize) -> Vec<f32> {
+    /// The fade and the replay position persist across calls, so a sustained loss goes silent
+    /// after ~180 ms however many packets it spans (see [`PLC_FLOOR`]).
+    ///
+    /// Reads `last_good` and advances only its own gain and position, never the synthesis state, so
+    /// concealment stays compatible with the `state_backup` rollback: nothing an invented-parameter
+    /// decode did can reach the audio this emits, and nothing this emits can reach the next
+    /// packet's decode.
+    fn conceal(&mut self, samps: usize) -> Vec<f32> {
         let seg_start = self.last_good.len().saturating_sub(SMPL_INTF_LEN);
         let seg = &self.last_good[seg_start..];
-        if seg.is_empty() {
-            return vec![0.0; samps];
-        }
         let mut out = Vec::with_capacity(samps);
-        let mut gain = 1.0f32;
-        while out.len() < samps {
-            let take = seg.len().min(samps - out.len());
-            out.extend(seg[..take].iter().map(|&s| s * gain));
-            gain *= PLC_FADE;
+        while !seg.is_empty() && out.len() < samps && self.conceal_gain >= PLC_FLOOR {
+            let pos = self.conceal_pos % seg.len();
+            let take = (seg.len() - pos).min(samps - out.len());
+            out.extend(seg[pos..pos + take].iter().map(|&s| s * self.conceal_gain));
+            self.conceal_pos = pos + take;
+            if self.conceal_pos == seg.len() {
+                self.conceal_pos = 0;
+                self.conceal_gain *= PLC_FADE;
+            }
         }
+        out.resize(samps, 0.0);
         out
     }
 
@@ -346,6 +368,8 @@ impl MlowDecoder {
                 frame[0]
             );
             self.report.inactive_or_sid = self.report.inactive_or_sid.saturating_add(1);
+            // The peer went quiet: a loss after this must not replay the speech from before it.
+            self.last_good.clear();
             return vec![0.0; samps];
         }
         // Operating-point guard for active frames: a different internal rate, the low_rate=1 2x160
@@ -577,6 +601,8 @@ impl MlowDecoder {
         if excess > 0 {
             self.last_good.drain(..excess);
         }
+        self.conceal_gain = 1.0;
+        self.conceal_pos = 0;
         if out_len > 0 && out_len != out.len() {
             out.resize(out_len, 0.0);
         }
@@ -1359,7 +1385,8 @@ mod tests {
     //
     // The dropped slot is packet-loss concealment, not zeros: with decode history present the drop
     // replays the last 20 ms under a fade, so the assertions below pin non-silence. Before any
-    // history (see the 10 ms test) concealment is exactly the silence it replaced.
+    // history concealment is exactly the silence it replaced (see
+    // `concealed_frame_replays_last_good_audio_with_fade`).
     #[test]
     fn unsupported_frames_drop_clean_without_desync() {
         let frames: Vec<String> =
@@ -1567,6 +1594,88 @@ mod tests {
             got_next, want_next,
             "concealment must not touch decode state"
         );
+    }
+
+    fn rms(v: &[f32]) -> f32 {
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    /// A low_rate=1 packet, dropped as off-point: the loss the encoder itself switches to under 30%
+    /// packet loss, so a bad network sends a long run of these.
+    const OFF_POINT_60MS: [u8; 4] = [0x54, 0xAA, 0xBB, 0xCC];
+
+    /// The fade runs across packets: a long run of lost packets ends in silence instead of
+    /// replaying the last 20 ms of speech at near-full volume on every one.
+    #[test]
+    fn sustained_concealment_decays_to_silence() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let mut dec = MlowDecoder::new();
+        let _ = dec.decode(&hex::decode(&frames[0]).unwrap());
+        let first = dec.decode(&OFF_POINT_60MS);
+        let mut last = first.clone();
+        for _ in 0..10 {
+            last = dec.decode(&OFF_POINT_60MS);
+        }
+        assert!(rms(&last) < rms(&first) * 0.1);
+        assert!(
+            last.iter().all(|&s| s == 0.0),
+            "600 ms into a loss the replay is past the floor and is silence"
+        );
+    }
+
+    /// A good packet ends the loss: the next one concealed starts from the new audio at full gain,
+    /// not from wherever the previous loss's fade had reached.
+    #[test]
+    fn a_decoded_packet_restarts_the_concealment_fade() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let mut dec = MlowDecoder::new();
+        let _ = dec.decode(&hex::decode(&frames[0]).unwrap());
+        for _ in 0..5 {
+            let _ = dec.decode(&OFF_POINT_60MS);
+        }
+
+        let good = dec.decode(&hex::decode(&frames[1]).unwrap());
+        let concealed = dec.decode(&OFF_POINT_60MS);
+
+        assert_eq!(
+            &concealed[..SMPL_INTF_LEN],
+            &good[good.len() - SMPL_INTF_LEN..],
+            "the first concealed segment replays the new tail at full gain"
+        );
+    }
+
+    /// After the peer goes quiet, a loss is silence: replaying the speech from before the SID would
+    /// put a word back into a pause.
+    #[test]
+    fn a_sid_clears_the_concealment_tail() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let mut dec = MlowDecoder::new();
+        let _ = dec.decode(&hex::decode(&frames[0]).unwrap());
+
+        let _ = dec.decode(&[0x80, 0xAA, 0xBB, 0xCC]);
+        let concealed = dec.decode(&OFF_POINT_60MS);
+
+        assert!(concealed.iter().all(|&s| s == 0.0));
+    }
+
+    /// Losses shorter than the replay segment continue it rather than repeating its first half,
+    /// which at 10 ms frames is a 100 Hz buzz.
+    #[test]
+    fn short_losses_continue_the_replay_instead_of_looping_its_head() {
+        let frames: Vec<String> =
+            serde_json::from_str(include_str!("testdata/inbound_capture_frames.json")).unwrap();
+        let mut dec = MlowDecoder::new();
+        let good = dec.decode(&hex::decode(&frames[0]).unwrap());
+        let seg = &good[good.len() - SMPL_INTF_LEN..];
+
+        let first = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
+        let second = dec.decode(&[0x40, 0xAA, 0xBB, 0xCC]);
+
+        assert_eq!(first.as_slice(), &seg[..SMPL_INTF_LEN / 2]);
+        assert_eq!(second.as_slice(), &seg[SMPL_INTF_LEN / 2..]);
     }
 
     // R7 (RED round-trip): a bare frame wrapped in a 1-redundant SplitRed envelope must decode to the
