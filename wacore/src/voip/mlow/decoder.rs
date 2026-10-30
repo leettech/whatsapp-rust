@@ -1548,7 +1548,7 @@ mod tests {
             syy += dz * dz;
         }
         let corr = sxy / (sxx * syy).sqrt();
-        assert!(corr > 0.99, "lag-0 corr {corr:.6} vs shipped reference");
+        assert!(corr > 0.999, "lag-0 corr {corr:.6} vs shipped reference");
     }
 
     /// Packet-loss concealment: a concealed frame replays the tail of the last good decode under a

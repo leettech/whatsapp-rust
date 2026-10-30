@@ -332,6 +332,8 @@ fn regenerate(root: &Path, out: &Path, cached: bool, check: bool) -> Result<()> 
         "wasm_derived_vad.json",
         "wasm_derived_120ms_frames.json",
         "wasm_derived_120ms_ref.raw",
+        "mlow_fec_frames.json",
+        "mlow_fec_ref.raw",
     ] {
         let payload = std::fs::read(out.join("artifacts").join(name))?;
         if check {
